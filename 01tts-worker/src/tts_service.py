@@ -7,6 +7,28 @@ from typing import Any
 import edge_tts
 
 
+def _probe_duration_ms(path: Path) -> int:
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    duration_ms = round(float(completed.stdout.strip()) * 1000)
+    if duration_ms <= 0:
+        raise RuntimeError(f"invalid audio duration for {path.name}")
+    return duration_ms
+
+
 async def generate_audio(text: str, output_path: Path, voice: str) -> Path:
     """Generate an MP3 using Edge TTS."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,6 +53,7 @@ async def generate_dialogue_audio(
     ) as temporary:
         temporary_dir = Path(temporary)
         segment_paths: list[Path] = []
+        segment_durations: list[int] = []
         for index, turn in enumerate(turns):
             speaker = str(turn.get("speaker", "")).strip().upper()
             text = str(turn.get("text", "")).strip()
@@ -44,6 +67,9 @@ async def generate_dialogue_audio(
                 rate="-5%",
             ).save(str(segment_path))
             segment_paths.append(segment_path)
+            segment_durations.append(
+                await asyncio.to_thread(_probe_duration_ms, segment_path)
+            )
 
         concat_file = temporary_dir / "segments.txt"
         concat_file.write_text(
@@ -70,6 +96,28 @@ async def generate_dialogue_audio(
             ],
             check=True,
         )
+        output_duration = await asyncio.to_thread(_probe_duration_ms, output_path)
+        measured_total = sum(segment_durations)
+        if measured_total <= 0:
+            raise RuntimeError("dialogue segments have no measurable duration")
+        start_ms = 0
+        cumulative_measured = 0
+        for index, (turn, segment_duration) in enumerate(
+            zip(turns, segment_durations)
+        ):
+            cumulative_measured += segment_duration
+            if index == len(turns) - 1:
+                end_ms = output_duration
+            else:
+                remaining_turns = len(turns) - index - 1
+                end_ms = round(
+                    cumulative_measured * output_duration / measured_total
+                )
+                end_ms = max(start_ms + 1, end_ms)
+                end_ms = min(end_ms, output_duration - remaining_turns)
+            turn["startMs"] = start_ms
+            turn["endMs"] = end_ms
+            start_ms = end_ms
     if not output_path.exists() or output_path.stat().st_size == 0:
         raise RuntimeError("dialogue audio output was not created")
     return output_path

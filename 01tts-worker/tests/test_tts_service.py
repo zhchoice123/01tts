@@ -17,10 +17,12 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
         communicate.return_value.save.assert_awaited_once_with(str(target))
 
     @patch("src.tts_service.subprocess.run")
+    @patch("src.tts_service._probe_duration_ms")
     @patch("src.tts_service.edge_tts.Communicate")
     async def test_dialogue_audio_uses_alternating_voices_and_ffmpeg(
         self,
         communicate,
+        probe_duration,
         run,
     ):
         async def save_segment(path):
@@ -33,19 +35,25 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             Path(command[-1]).write_bytes(b"dialogue")
 
         run.side_effect = create_output
+        probe_duration.side_effect = [2100, 3900, 6000]
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "dialogue.mp3"
+            turns = [
+                {"speaker": "HOST", "text": "What caused the outage?"},
+                {
+                    "speaker": "EXPERT",
+                    "text": "A database connection pool was exhausted.",
+                },
+            ]
             result = await generate_dialogue_audio(
-                [
-                    {"speaker": "HOST", "text": "What caused the outage?"},
-                    {
-                        "speaker": "EXPERT",
-                        "text": "A database connection pool was exhausted.",
-                    },
-                ],
+                turns,
                 target,
             )
             self.assertEqual(b"dialogue", target.read_bytes())
+            self.assertEqual(0, turns[0]["startMs"])
+            self.assertEqual(2100, turns[0]["endMs"])
+            self.assertEqual(2100, turns[1]["startMs"])
+            self.assertEqual(6000, turns[1]["endMs"])
 
         self.assertEqual(target, result)
         self.assertEqual(

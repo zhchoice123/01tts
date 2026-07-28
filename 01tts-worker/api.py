@@ -5,13 +5,14 @@ import tempfile
 from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
+from uuid import UUID
 
 import redis
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.backend_config import BackendConfig, load_backend_config
 from src.backend_models import create_session_factory
@@ -69,6 +70,43 @@ class CompleteAnswerRequest(BaseModel):
     transcript: str
     score: int = Field(ge=0, le=100)
     feedback: str
+
+
+class LearningProgressRequest(BaseModel):
+    clientId: UUID
+    contentUuid: UUID
+    positionMs: int = Field(ge=0, le=86_400_000)
+    durationMs: int = Field(ge=0, le=86_400_000)
+    vocabularyDone: bool = False
+    listeningDone: bool = False
+    readingDone: bool = False
+    quizCorrect: int = Field(default=0, ge=0, le=1000)
+    quizTotal: int = Field(default=0, ge=0, le=1000)
+    speakingScore: int | None = Field(default=None, ge=0, le=100)
+    completed: bool = False
+
+    @model_validator(mode="after")
+    def validate_progress(self):
+        if self.positionMs > self.durationMs:
+            raise ValueError("positionMs must not exceed durationMs")
+        if self.quizCorrect > self.quizTotal:
+            raise ValueError("quizCorrect must not exceed quizTotal")
+        return self
+
+
+class VocabularyProgressRequest(BaseModel):
+    clientId: UUID
+    contentUuid: UUID
+    word: str = Field(min_length=1, max_length=120)
+    status: Literal["NEW", "LEARNING", "KNOWN"]
+
+    @field_validator("word")
+    @classmethod
+    def validate_word(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("word must not be blank")
+        return normalized
 
 
 class AnkiReviewWordRequest(BaseModel):
@@ -249,6 +287,70 @@ def create_app(
     @app.get("/api/v1/library")
     def library(request: Request) -> list[dict[str, Any]]:
         return backend(request).library()
+
+    @app.put("/api/v1/learning/progress")
+    def put_learning_progress(
+        payload: LearningProgressRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        return backend(request).upsert_learning_progress(
+            client_id=str(payload.clientId),
+            content_uuid=str(payload.contentUuid),
+            position_ms=payload.positionMs,
+            duration_ms=payload.durationMs,
+            vocabulary_done=payload.vocabularyDone,
+            listening_done=payload.listeningDone,
+            reading_done=payload.readingDone,
+            quiz_correct=payload.quizCorrect,
+            quiz_total=payload.quizTotal,
+            speaking_score=payload.speakingScore,
+            completed=payload.completed,
+        )
+
+    @app.get("/api/v1/learning/progress/{client_id}/{content_uuid}")
+    def get_learning_progress(
+        client_id: UUID,
+        content_uuid: UUID,
+        request: Request,
+    ) -> dict[str, Any]:
+        progress = backend(request).get_learning_progress(
+            str(client_id),
+            str(content_uuid),
+        )
+        if not progress:
+            raise HTTPException(404, "learning progress not found")
+        return progress
+
+    @app.get("/api/v1/learning/dashboard/{client_id}")
+    def get_learning_dashboard(
+        client_id: UUID,
+        request: Request,
+        days: Annotated[int, Query(ge=1, le=90)] = 7,
+    ) -> dict[str, Any]:
+        return backend(request).learning_dashboard(str(client_id), days)
+
+    @app.put("/api/v1/learning/vocabulary")
+    def put_vocabulary_progress(
+        payload: VocabularyProgressRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        return backend(request).upsert_vocabulary_progress(
+            client_id=str(payload.clientId),
+            content_uuid=str(payload.contentUuid),
+            word=payload.word,
+            status=payload.status,
+        )
+
+    @app.get("/api/v1/learning/vocabulary/{client_id}")
+    def get_vocabulary_progress(
+        client_id: UUID,
+        request: Request,
+        status: Literal["NEW", "LEARNING", "KNOWN"] | None = None,
+    ) -> list[dict[str, Any]]:
+        return backend(request).list_vocabulary_progress(
+            str(client_id),
+            status,
+        )
 
     @app.post("/api/v1/long-lessons", status_code=202)
     def create_long_lesson(

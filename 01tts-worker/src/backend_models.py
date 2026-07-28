@@ -1,6 +1,17 @@
 from datetime import date, datetime, timezone
 
-from sqlalchemy import Date, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Date,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -64,6 +75,56 @@ class LearningAttemptRecord(Base):
     answers_json: Mapped[str] = mapped_column(Text, nullable=False)
     correct_count: Mapped[int | None] = mapped_column(Integer)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
+class LearningProgressRecord(Base):
+    __tablename__ = "learning_progress"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "content_uuid",
+            name="uq_learning_progress_client_content",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    content_uuid: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    position_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    duration_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    vocabulary_done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    listening_done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reading_done: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    quiz_correct: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    quiz_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    speaking_score: Mapped[int | None] = mapped_column(Integer)
+    completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, index=True
+    )
+
+
+class VocabularyProgressRecord(Base):
+    __tablename__ = "vocabulary_progress"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "normalized_word",
+            name="uq_vocabulary_progress_client_word",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    content_uuid: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    word: Mapped[str] = mapped_column(String(120), nullable=False)
+    normalized_word: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="NEW")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, index=True
+    )
 
 
 class SpeakingAnswerRecord(Base):

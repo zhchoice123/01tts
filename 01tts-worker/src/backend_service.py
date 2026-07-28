@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import threading
 import uuid as uuid_module
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -24,9 +24,12 @@ from src.backend_models import (
     DailyGenerationRunRecord,
     DailyPlanRecord,
     LearningAttemptRecord,
+    LearningProgressRecord,
     SpeakingAnswerRecord,
     TaskRecord,
     TopicCandidateRecord,
+    VocabularyProgressRecord,
+    utc_now,
 )
 from src.content_ingestion import fetch_content, fetch_feed_candidates
 from src.deepseek_service import DeepSeekService, count_english_words
@@ -363,6 +366,186 @@ class BackendService:
         with self.session_factory() as session:
             task = session.get(TaskRecord, task_uuid)
             return self.task_dict(task) if task else None
+
+    def upsert_learning_progress(
+        self,
+        *,
+        client_id: str,
+        content_uuid: str,
+        position_ms: int,
+        duration_ms: int,
+        vocabulary_done: bool,
+        listening_done: bool,
+        reading_done: bool,
+        quiz_correct: int,
+        quiz_total: int,
+        speaking_score: int | None,
+        completed: bool,
+    ) -> dict[str, Any]:
+        with self.session_factory() as session:
+            progress = session.scalar(
+                select(LearningProgressRecord).where(
+                    LearningProgressRecord.client_id == client_id,
+                    LearningProgressRecord.content_uuid == content_uuid,
+                )
+            )
+            if progress is None:
+                progress = LearningProgressRecord(
+                    client_id=client_id,
+                    content_uuid=content_uuid,
+                )
+                session.add(progress)
+            progress.position_ms = position_ms
+            progress.duration_ms = duration_ms
+            progress.vocabulary_done = vocabulary_done
+            progress.listening_done = listening_done
+            progress.reading_done = reading_done
+            progress.quiz_correct = quiz_correct
+            progress.quiz_total = quiz_total
+            progress.speaking_score = speaking_score
+            progress.completed = completed
+            progress.updated_at = utc_now()
+            session.commit()
+            return self.learning_progress_dict(progress)
+
+    def get_learning_progress(
+        self,
+        client_id: str,
+        content_uuid: str,
+    ) -> dict[str, Any] | None:
+        with self.session_factory() as session:
+            progress = session.scalar(
+                select(LearningProgressRecord).where(
+                    LearningProgressRecord.client_id == client_id,
+                    LearningProgressRecord.content_uuid == content_uuid,
+                )
+            )
+            return self.learning_progress_dict(progress) if progress else None
+
+    def upsert_vocabulary_progress(
+        self,
+        *,
+        client_id: str,
+        content_uuid: str,
+        word: str,
+        status: str,
+    ) -> dict[str, Any]:
+        normalized_word = word.strip().casefold()
+        with self.session_factory() as session:
+            vocabulary = session.scalar(
+                select(VocabularyProgressRecord).where(
+                    VocabularyProgressRecord.client_id == client_id,
+                    VocabularyProgressRecord.normalized_word == normalized_word,
+                )
+            )
+            if vocabulary is None:
+                vocabulary = VocabularyProgressRecord(
+                    client_id=client_id,
+                    content_uuid=content_uuid,
+                    word=word.strip(),
+                    normalized_word=normalized_word,
+                )
+                session.add(vocabulary)
+            vocabulary.content_uuid = content_uuid
+            vocabulary.word = word.strip()
+            vocabulary.status = status
+            vocabulary.updated_at = utc_now()
+            session.commit()
+            return self.vocabulary_progress_dict(vocabulary)
+
+    def list_vocabulary_progress(
+        self,
+        client_id: str,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        with self.session_factory() as session:
+            query = select(VocabularyProgressRecord).where(
+                VocabularyProgressRecord.client_id == client_id
+            )
+            if status:
+                query = query.where(VocabularyProgressRecord.status == status)
+            vocabulary = session.scalars(
+                query.order_by(VocabularyProgressRecord.updated_at.desc())
+            ).all()
+            return [self.vocabulary_progress_dict(item) for item in vocabulary]
+
+    def learning_dashboard(
+        self,
+        client_id: str,
+        days: int,
+    ) -> dict[str, Any]:
+        now = datetime.now(ZoneInfo(self.config.timezone))
+        first_day = now.date() - timedelta(days=days - 1)
+        with self.session_factory() as session:
+            all_progress = session.scalars(
+                select(LearningProgressRecord).where(
+                    LearningProgressRecord.client_id == client_id
+                )
+            ).all()
+            all_vocabulary = session.scalars(
+                select(VocabularyProgressRecord).where(
+                    VocabularyProgressRecord.client_id == client_id
+                )
+            ).all()
+
+        progress = [
+            item
+            for item in all_progress
+            if self._local_date(item.updated_at) >= first_day
+        ]
+        vocabulary = [
+            item
+            for item in all_vocabulary
+            if self._local_date(item.updated_at) >= first_day
+        ]
+        speaking_scores = [
+            item.speaking_score
+            for item in progress
+            if item.speaking_score is not None
+        ]
+        latest = max(all_progress, key=lambda item: self._as_utc(item.updated_at), default=None)
+        activity_days = {
+            self._local_date(item.updated_at)
+            for item in [*all_progress, *all_vocabulary]
+        }
+        return {
+            "days": days,
+            "listeningMinutes": sum(item.position_ms for item in progress) // 60_000,
+            "completedLessons": sum(1 for item in progress if item.completed),
+            "quizCorrect": sum(item.quiz_correct for item in progress),
+            "quizTotal": sum(item.quiz_total for item in progress),
+            "speakingAverage": (
+                round(sum(speaking_scores) / len(speaking_scores))
+                if speaking_scores
+                else 0
+            ),
+            "currentStreak": self._current_streak(activity_days, now.date()),
+            "wordsReviewed": sum(
+                1 for item in vocabulary if item.status in {"LEARNING", "KNOWN"}
+            ),
+            "latestContentUuid": latest.content_uuid if latest else None,
+            "latestPositionMs": latest.position_ms if latest else 0,
+        }
+
+    def _local_date(self, value: datetime) -> date:
+        return self._as_utc(value).astimezone(
+            ZoneInfo(self.config.timezone)
+        ).date()
+
+    @staticmethod
+    def _as_utc(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @staticmethod
+    def _current_streak(activity_days: set[date], today: date) -> int:
+        streak = 0
+        cursor = today
+        while cursor in activity_days:
+            streak += 1
+            cursor -= timedelta(days=1)
+        return streak
 
     def create_content(
         self,
@@ -1237,7 +1420,14 @@ class BackendService:
 
     @staticmethod
     def iso(value: datetime | None) -> str | None:
-        return value.isoformat().replace("+00:00", "Z") if value else None
+        if not value:
+            return None
+        normalized = (
+            value.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None
+            else value.astimezone(timezone.utc)
+        )
+        return normalized.isoformat().replace("+00:00", "Z")
 
     @classmethod
     def task_dict(cls, task: TaskRecord) -> dict[str, Any]:
@@ -1286,6 +1476,39 @@ class BackendService:
                 }
             )
         return result
+
+    @classmethod
+    def learning_progress_dict(
+        cls,
+        progress: LearningProgressRecord,
+    ) -> dict[str, Any]:
+        return {
+            "clientId": progress.client_id,
+            "contentUuid": progress.content_uuid,
+            "positionMs": progress.position_ms,
+            "durationMs": progress.duration_ms,
+            "vocabularyDone": progress.vocabulary_done,
+            "listeningDone": progress.listening_done,
+            "readingDone": progress.reading_done,
+            "quizCorrect": progress.quiz_correct,
+            "quizTotal": progress.quiz_total,
+            "speakingScore": progress.speaking_score,
+            "completed": progress.completed,
+            "updatedAt": cls.iso(progress.updated_at),
+        }
+
+    @classmethod
+    def vocabulary_progress_dict(
+        cls,
+        vocabulary: VocabularyProgressRecord,
+    ) -> dict[str, Any]:
+        return {
+            "clientId": vocabulary.client_id,
+            "contentUuid": vocabulary.content_uuid,
+            "word": vocabulary.word,
+            "status": vocabulary.status,
+            "updatedAt": cls.iso(vocabulary.updated_at),
+        }
 
     @classmethod
     def answer_dict(cls, answer: SpeakingAnswerRecord) -> dict[str, Any]:

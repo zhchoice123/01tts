@@ -1,14 +1,21 @@
 import json
 import tempfile
 import unittest
-from datetime import date
+import uuid
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
+from sqlalchemy import func, select
 
 from api import create_app
 from src.backend_config import BackendConfig
-from src.backend_models import create_session_factory
+from src.backend_models import (
+    LearningProgressRecord,
+    VocabularyProgressRecord,
+    create_session_factory,
+)
 from src.backend_service import BackendService
 from src.config import WorkerConfig
 from src.content_ingestion import ContentMetadata
@@ -114,6 +121,11 @@ async def fake_dialogue_audio_generator(
 ):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b"ID3-fake-dialogue-mp3")
+    position = 0
+    for turn in turns:
+        turn["startMs"] = position
+        position += 3000
+        turn["endMs"] = position
     return output_path
 
 
@@ -306,10 +318,220 @@ class BackendApiTest(unittest.TestCase):
         lesson = json.loads(completed["lessonContent"])
         self.assertEqual("DIALOGUE", lesson["format"])
         self.assertEqual(20, len(lesson["dialogue"]))
+        self.assertEqual(0, lesson["dialogue"][0]["startMs"])
+        self.assertEqual(60_000, lesson["dialogue"][-1]["endMs"])
         self.assertEqual(
             b"ID3-fake-dialogue-mp3",
             self.client.get(completed["audioUrl"]).content,
         )
+
+    def test_learning_progress_upsert_and_read(self):
+        client_id = str(uuid.uuid4())
+        content_uuid = str(uuid.uuid4())
+        payload = {
+            "clientId": client_id,
+            "contentUuid": content_uuid,
+            "positionMs": 120_000,
+            "durationMs": 600_000,
+            "vocabularyDone": True,
+            "listeningDone": False,
+            "readingDone": False,
+            "quizCorrect": 2,
+            "quizTotal": 5,
+            "speakingScore": None,
+            "completed": False,
+        }
+        created = self.client.put("/api/v1/learning/progress", json=payload)
+        self.assertEqual(200, created.status_code)
+        payload.update(
+            {
+                "positionMs": 245_000,
+                "listeningDone": True,
+                "quizCorrect": 4,
+                "speakingScore": 86,
+            }
+        )
+        updated = self.client.put("/api/v1/learning/progress", json=payload)
+        self.assertEqual(200, updated.status_code)
+        self.assertEqual(245_000, updated.json()["positionMs"])
+        self.assertEqual(86, updated.json()["speakingScore"])
+        loaded = self.client.get(
+            f"/api/v1/learning/progress/{client_id}/{content_uuid}"
+        )
+        self.assertEqual(updated.json(), loaded.json())
+        with self.service.session_factory() as session:
+            count = session.scalar(
+                select(func.count()).select_from(LearningProgressRecord)
+            )
+        self.assertEqual(1, count)
+
+    def test_learning_progress_validation(self):
+        valid_ids = {
+            "clientId": str(uuid.uuid4()),
+            "contentUuid": str(uuid.uuid4()),
+        }
+        defaults = {
+            **valid_ids,
+            "positionMs": 100,
+            "durationMs": 200,
+        }
+        for changes in (
+            {"clientId": "not-a-uuid"},
+            {"contentUuid": "x" * 36},
+            {"positionMs": -1},
+            {"positionMs": 201, "durationMs": 200},
+            {"durationMs": 86_400_001},
+            {"quizCorrect": 2, "quizTotal": 1},
+            {"speakingScore": 101},
+        ):
+            with self.subTest(changes=changes):
+                response = self.client.put(
+                    "/api/v1/learning/progress",
+                    json={**defaults, **changes},
+                )
+                self.assertEqual(422, response.status_code)
+        self.assertEqual(
+            422,
+            self.client.get(
+                f"/api/v1/learning/progress/not-a-uuid/{uuid.uuid4()}"
+            ).status_code,
+        )
+
+    def test_learning_dashboard_aggregation_and_streak(self):
+        client_id = str(uuid.uuid4())
+        first_content = str(uuid.uuid4())
+        second_content = str(uuid.uuid4())
+        old_content = str(uuid.uuid4())
+        for content_uuid, position, completed, correct, total, score in (
+            (first_content, 120_000, True, 4, 5, 80),
+            (second_content, 180_000, False, 3, 5, 90),
+            (old_content, 900_000, True, 5, 5, 100),
+        ):
+            self.service.upsert_learning_progress(
+                client_id=client_id,
+                content_uuid=content_uuid,
+                position_ms=position,
+                duration_ms=900_000,
+                vocabulary_done=True,
+                listening_done=completed,
+                reading_done=completed,
+                quiz_correct=correct,
+                quiz_total=total,
+                speaking_score=score,
+                completed=completed,
+            )
+        self.service.upsert_vocabulary_progress(
+            client_id=client_id,
+            content_uuid=first_content,
+            word="backpressure",
+            status="LEARNING",
+        )
+        self.service.upsert_vocabulary_progress(
+            client_id=client_id,
+            content_uuid=second_content,
+            word="throughput",
+            status="KNOWN",
+        )
+
+        zone = ZoneInfo("Asia/Shanghai")
+        today = datetime.now(zone).date()
+
+        def local_noon(day):
+            return datetime.combine(day, time(12), zone).astimezone(timezone.utc)
+
+        with self.service.session_factory() as session:
+            progress = {
+                item.content_uuid: item
+                for item in session.scalars(
+                    select(LearningProgressRecord).where(
+                        LearningProgressRecord.client_id == client_id
+                    )
+                )
+            }
+            progress[first_content].updated_at = local_noon(today - timedelta(days=1))
+            progress[second_content].updated_at = local_noon(today)
+            progress[old_content].updated_at = local_noon(today - timedelta(days=10))
+            words = session.scalars(
+                select(VocabularyProgressRecord).where(
+                    VocabularyProgressRecord.client_id == client_id
+                )
+            ).all()
+            for word in words:
+                word.updated_at = local_noon(today)
+            session.commit()
+
+        dashboard = self.client.get(
+            f"/api/v1/learning/dashboard/{client_id}?days=7"
+        )
+        self.assertEqual(200, dashboard.status_code)
+        self.assertEqual(
+            {
+                "days": 7,
+                "listeningMinutes": 5,
+                "completedLessons": 1,
+                "quizCorrect": 7,
+                "quizTotal": 10,
+                "speakingAverage": 85,
+                "currentStreak": 2,
+                "wordsReviewed": 2,
+                "latestContentUuid": second_content,
+                "latestPositionMs": 180_000,
+            },
+            dashboard.json(),
+        )
+        self.assertEqual(
+            422,
+            self.client.get(
+                f"/api/v1/learning/dashboard/{client_id}?days=0"
+            ).status_code,
+        )
+
+    def test_vocabulary_upsert_is_case_insensitive_and_filterable(self):
+        client_id = str(uuid.uuid4())
+        first_content = str(uuid.uuid4())
+        second_content = str(uuid.uuid4())
+        first = self.client.put(
+            "/api/v1/learning/vocabulary",
+            json={
+                "clientId": client_id,
+                "contentUuid": first_content,
+                "word": " Backpressure ",
+                "status": "NEW",
+            },
+        )
+        self.assertEqual(200, first.status_code)
+        second = self.client.put(
+            "/api/v1/learning/vocabulary",
+            json={
+                "clientId": client_id,
+                "contentUuid": second_content,
+                "word": "backpressure",
+                "status": "LEARNING",
+            },
+        )
+        self.assertEqual(200, second.status_code)
+        self.assertEqual(second_content, second.json()["contentUuid"])
+        listed = self.client.get(
+            f"/api/v1/learning/vocabulary/{client_id}?status=LEARNING"
+        )
+        self.assertEqual(200, listed.status_code)
+        self.assertEqual(1, len(listed.json()))
+        self.assertEqual("backpressure", listed.json()[0]["word"])
+        with self.service.session_factory() as session:
+            count = session.scalar(
+                select(func.count()).select_from(VocabularyProgressRecord)
+            )
+        self.assertEqual(1, count)
+        invalid_status = self.client.put(
+            "/api/v1/learning/vocabulary",
+            json={
+                "clientId": client_id,
+                "contentUuid": second_content,
+                "word": "latency",
+                "status": "MASTERED",
+            },
+        )
+        self.assertEqual(422, invalid_status.status_code)
 
     def test_speaking_answer_processing(self):
         task = self.client.post(
