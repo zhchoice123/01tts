@@ -197,6 +197,8 @@ class MainActivity : ComponentActivity() {
                     PreferencesLessonHistoryStore(applicationContext),
                     PreferencesThemePreferenceStore(applicationContext),
                     PreferencesLanguagePreferenceStore(applicationContext),
+                    PreferencesClientIdStore(applicationContext),
+                    PreferencesLearningProgressStore(applicationContext),
                 )
             }
             val state by model.state.collectAsStateWithLifecycle()
@@ -549,10 +551,16 @@ private fun TodayHub(
     onRefresh: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val completed = listOfNotNull(
-        state.quizTotal?.let { "Reading quiz ${state.quizCorrect ?: 0}/$it" },
-        state.answer?.score?.let { "Speaking score $it/100" },
+    val todayUuid = state.dailyPlan?.contentUuid
+    val progress = state.todayProgress?.takeIf { it.contentUuid == todayUuid }
+    val journey = listOf(
+        localized(languageId, "Vocabulary warm-up", "核心词汇") to (progress?.vocabularyDone == true),
+        localized(languageId, "Blind listening", "盲听训练") to (progress?.listeningDone == true),
+        localized(languageId, "Transcript reading", "对照阅读") to (progress?.readingDone == true),
+        localized(languageId, "Comprehension quiz", "理解测试") to ((progress?.quizTotal ?: 0) > 0),
+        localized(languageId, "Spoken summary", "口语总结") to (progress?.speakingScore != null),
     )
+    val completedCount = journey.count { it.second }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(20.dp),
@@ -632,12 +640,64 @@ private fun TodayHub(
                             style = MaterialTheme.typography.labelLarge,
                         )
                     }
-                    listOf(
-                        localized(languageId, "Vocabulary warm-up · 5 min", "核心词汇 · 5 分钟"),
-                        localized(languageId, "Technical reading · 8 min", "英文阅读 · 8 分钟"),
-                        localized(languageId, "Listening replay · 4 min", "听力回放 · 4 分钟"),
-                        localized(languageId, "Spoken summary · 3 min", "口语总结 · 3 分钟"),
-                    ).forEach { Text("• $it", color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            localized(languageId, "Today's learning path", "今日学习路径"),
+                            style = MaterialTheme.typography.titleMedium,
+                        )
+                        Text(
+                            "$completedCount / ${journey.size}",
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                    }
+                    LinearProgressIndicator(
+                        progress = { completedCount / journey.size.toFloat() },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    journey.forEachIndexed { index, (label, done) ->
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Surface(
+                                modifier = Modifier.size(28.dp),
+                                shape = CircleShape,
+                                color = if (done) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.surface
+                                },
+                                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+                            ) {
+                                Box(contentAlignment = Alignment.Center) {
+                                    if (done) {
+                                        Icon(
+                                            Icons.Default.Check,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(16.dp),
+                                            tint = MaterialTheme.colorScheme.onPrimary,
+                                        )
+                                    } else {
+                                        Text("${index + 1}", style = MaterialTheme.typography.labelMedium)
+                                    }
+                                }
+                            }
+                            Spacer(Modifier.width(12.dp))
+                            Text(
+                                label,
+                                color = if (done) {
+                                    MaterialTheme.colorScheme.onSurface
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                },
+                            )
+                        }
+                    }
                     if (plan?.content?.status == "READY") {
                         PrimaryButton(
                             text = if (state.task?.taskUuid == plan.content.uuid) {
@@ -670,16 +730,80 @@ private fun TodayHub(
                 }
             }
         }
-        if (completed.isNotEmpty()) {
-            item {
-                Surface(color = MaterialTheme.colorScheme.primaryContainer, shape = RoundedCornerShape(14.dp)) {
-                    Column(Modifier.padding(16.dp)) {
-                        Text("Saved progress", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
-                        completed.forEach { Text(it, color = MaterialTheme.colorScheme.onSurface) }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        localized(languageId, "Last seven days", "最近七天"),
+                        style = MaterialTheme.typography.titleLarge,
+                    )
+                    state.dashboard?.let {
+                        Text(
+                            localized(
+                                languageId,
+                                "${it.currentStreak} day streak",
+                                "连续 ${it.currentStreak} 天",
+                            ),
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.labelLarge,
+                        )
                     }
+                }
+                if (state.dashboardLoading && state.dashboard == null) {
+                    repeat(2) {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = MaterialTheme.colorScheme.outline,
+                        )
+                    }
+                } else {
+                    val dashboard = state.dashboard
+                    if (dashboard == null) {
+                        Text(
+                            localized(
+                                languageId,
+                                "No cloud summary yet. Complete today's lesson to start your trend.",
+                                "还没有云端学习概览，完成今日课程后即可开始记录。",
+                            ),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            DashboardMetric("${dashboard.listeningMinutes}", localized(languageId, "minutes", "分钟"))
+                            DashboardMetric("${dashboard.completedLessons}", localized(languageId, "lessons", "课程"))
+                            DashboardMetric(
+                                "${dashboard.quizCorrect}/${dashboard.quizTotal}",
+                                localized(languageId, "quiz", "答题"),
+                            )
+                            DashboardMetric("${dashboard.wordsReviewed}", localized(languageId, "words", "词汇"))
+                        }
+                    }
+                }
+                state.learningSyncMessage?.let {
+                    Text(
+                        it,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun DashboardMetric(value: String, label: String) {
+    Column(horizontalAlignment = Alignment.Start) {
+        Text(value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+        Text(label, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -709,7 +833,7 @@ private fun ReadingHub(
     ) {
         item {
             Text(localized(languageId, "Reading center", "阅读训练"), style = MaterialTheme.typography.headlineMedium)
-            Text(localized(languageId, "Daily source-backed and AI-original topics prepared at 05:00.", "每天 05:00 准备有来源的新闻与 AI 原创话题。"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(localized(languageId, "Daily source-backed and AI-original topics prepared at 06:00.", "每天 06:00 准备有来源的新闻与 AI 原创话题。"), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         item {
             Surface(
@@ -1516,6 +1640,24 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
     val task = state.task ?: return
     val questions = remember(task.questions) { parseQuestions(task.questions) }
     val vocabulary = remember(task.vocabulary) { parseVocabulary(task.vocabulary) }
+    val dialogue = remember(task.lessonContent) { parseDialogue(task.lessonContent) }
+    val progress = state.currentProgress?.takeIf { it.contentUuid == task.taskUuid }
+    var transcriptVisible by rememberSaveable(task.taskUuid) { mutableStateOf(false) }
+    var playbackPosition by rememberSaveable(task.taskUuid) {
+        mutableLongStateOf(progress?.positionMs ?: 0L)
+    }
+    var seekRequest by remember(task.taskUuid) { mutableStateOf<PlaybackSeekRequest?>(null) }
+    var seekSequence by remember(task.taskUuid) { mutableLongStateOf(0L) }
+    val activeTurn = remember(dialogue, playbackPosition) {
+        activeDialogueIndex(dialogue, playbackPosition)
+    }
+    LaunchedEffect(progress?.positionMs) {
+        val restored = progress?.positionMs ?: 0L
+        if (restored > 0 && playbackPosition == 0L) {
+            seekSequence += 1
+            seekRequest = PlaybackSeekRequest(seekSequence, restored)
+        }
+    }
     val context = LocalContext.current
     var wordSpeaker by remember { mutableStateOf<TextToSpeech?>(null) }
     DisposableEffect(context) {
@@ -1542,7 +1684,15 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
     ) {
         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("Your listening lesson", style = MaterialTheme.typography.headlineMedium)
-            Text(task.prompt, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                if (dialogue.isNotEmpty()) {
+                    "Listen first, then reveal the HOST and EXPERT transcript."
+                } else {
+                    "Listen first, then reveal the lesson transcript."
+                },
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 MetadataPill(task.difficulty.replaceFirstChar(Char::uppercase))
                 MetadataPill(task.voice.substringAfterLast("-").removeSuffix("Neural"))
@@ -1551,7 +1701,79 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
         }
 
         task.audioUrl?.let {
-            AudioLessonPlayer(ApiClient.resolveMediaUrl(it))
+            AudioLessonPlayer(
+                url = ApiClient.resolveMediaUrl(it),
+                initialPositionMs = progress?.positionMs ?: 0L,
+                transcriptVisible = transcriptVisible,
+                seekRequest = seekRequest,
+                onToggleTranscript = {
+                    transcriptVisible = !transcriptVisible
+                    if (transcriptVisible) model.markReadingDone()
+                },
+                onProgress = { positionMs, durationMs ->
+                    playbackPosition = positionMs
+                    model.onPlaybackProgress(positionMs, durationMs)
+                },
+            )
+        }
+        if ((progress?.positionMs ?: 0L) > 0) {
+            Text(
+                "Resumed from ${formatDialogueTime(progress?.positionMs ?: 0L)}",
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelLarge,
+            )
+        }
+
+        state.learningSyncMessage?.let {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Text(
+                    it,
+                    modifier = Modifier.padding(12.dp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+
+        AnimatedVisibility(visible = transcriptVisible) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+                Text(
+                    if (dialogue.isNotEmpty()) "Dialogue transcript" else "Lesson transcript",
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                if (dialogue.isEmpty()) {
+                    Text(
+                        task.prompt,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else {
+                    dialogue.forEachIndexed { index, turn ->
+                        DialogueTurnRow(
+                            turn = turn,
+                            active = index == activeTurn,
+                            canSeek = turn.startMs != null,
+                            onClick = {
+                                turn.startMs?.let { startMs ->
+                                    seekSequence += 1
+                                    seekRequest = PlaybackSeekRequest(seekSequence, startMs)
+                                }
+                            },
+                        )
+                    }
+                    if (dialogue.none { it.startMs != null }) {
+                        Text(
+                            "This lesson has no sentence timing yet. The transcript remains available without tap-to-seek.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
         }
 
         if (vocabulary.isNotEmpty()) {
@@ -1610,8 +1832,49 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                             if (item.example.isNotBlank()) {
                                 Text(item.example, style = MaterialTheme.typography.bodyMedium)
                             }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                listOf(
+                                    "LEARNING" to "Review again",
+                                    "KNOWN" to "I know this",
+                                ).forEach { (status, label) ->
+                                    FilterChip(
+                                        selected = state.vocabularyStatuses[item.word] == status,
+                                        onClick = { model.reviewVocabulary(item.word, status) },
+                                        label = { Text(label) },
+                                        leadingIcon = if (
+                                            state.vocabularyStatuses[item.word] == status
+                                        ) {
+                                            {
+                                                Icon(
+                                                    Icons.Default.Check,
+                                                    contentDescription = null,
+                                                    modifier = Modifier.size(16.dp),
+                                                )
+                                            }
+                                        } else {
+                                            null
+                                        },
+                                    )
+                                }
+                            }
                         }
                     }
+                }
+                if (progress?.vocabularyDone != true) {
+                    OutlinedButton(
+                        onClick = model::markVocabularyDone,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Default.Check, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Mark vocabulary reviewed")
+                    }
+                } else {
+                    Text(
+                        "Vocabulary reviewed",
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
                 }
             }
         }
@@ -1640,6 +1903,65 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
         }
         Spacer(Modifier.height(20.dp))
     }
+}
+
+@Composable
+private fun DialogueTurnRow(
+    turn: DialogueTurn,
+    active: Boolean,
+    canSeek: Boolean,
+    onClick: () -> Unit,
+) {
+    val isHost = turn.speaker == "HOST"
+    val roleColor = if (isHost) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val background = if (active) {
+        MaterialTheme.colorScheme.primaryContainer
+    } else {
+        Color.Transparent
+    }
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .background(background)
+            .clickable(enabled = canSeek, onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.Top,
+    ) {
+        Box(
+            modifier = Modifier
+                .width(3.dp)
+                .height(52.dp)
+                .clip(CircleShape)
+                .background(roleColor),
+        )
+        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                turn.speaker,
+                color = roleColor,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(turn.text, style = MaterialTheme.typography.bodyLarge)
+            if (canSeek) {
+                Text(
+                    "Tap to play from ${formatDialogueTime(turn.startMs ?: 0)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+    }
+}
+
+private fun formatDialogueTime(milliseconds: Long): String {
+    val seconds = milliseconds.coerceAtLeast(0) / 1_000
+    return "%d:%02d".format(seconds / 60, seconds % 60)
 }
 
 @Composable
@@ -1862,9 +2184,9 @@ private fun SpeakingStep(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        EvaluationMetricChip("🎯 发音 (Pronunciation)", "$pronScore", Modifier.weight(1f))
-                        EvaluationMetricChip("🌊 流利 (Fluency)", "$fluencyScore", Modifier.weight(1f))
-                        EvaluationMetricChip("📚 语法 (Grammar)", "$vocabScore", Modifier.weight(1f))
+                        EvaluationMetricChip("发音 (Pronunciation)", "$pronScore", Modifier.weight(1f))
+                        EvaluationMetricChip("流利 (Fluency)", "$fluencyScore", Modifier.weight(1f))
+                        EvaluationMetricChip("语法 (Grammar)", "$vocabScore", Modifier.weight(1f))
                     }
 
                     answer.transcript?.let {

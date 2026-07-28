@@ -10,6 +10,8 @@ import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Replay10
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Icon
@@ -39,8 +41,24 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.delay
 
+data class PlaybackSeekRequest(val id: Long, val positionMs: Long)
+
+internal fun nextPlaybackSpeed(current: Float): Float = when (current) {
+    0.8f -> 1f
+    1f -> 1.2f
+    else -> 0.8f
+}
+
 @Composable
-fun AudioLessonPlayer(url: String, modifier: Modifier = Modifier) {
+fun AudioLessonPlayer(
+    url: String,
+    initialPositionMs: Long = 0,
+    transcriptVisible: Boolean = true,
+    seekRequest: PlaybackSeekRequest? = null,
+    onToggleTranscript: () -> Unit = {},
+    onProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
+    modifier: Modifier = Modifier,
+) {
     val context = LocalContext.current
     var position by remember(url) { mutableLongStateOf(0L) }
     var duration by remember(url) { mutableLongStateOf(0L) }
@@ -48,10 +66,13 @@ fun AudioLessonPlayer(url: String, modifier: Modifier = Modifier) {
     var dragging by remember(url) { mutableStateOf(false) }
     var speed by remember(url) { mutableFloatStateOf(1f) }
     var playbackError by remember(url) { mutableStateOf<String?>(null) }
+    var lastReportedPosition by remember(url) { mutableLongStateOf(-1L) }
+    var lastReportedDuration by remember(url) { mutableLongStateOf(-1L) }
     val player = remember(url) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(url))
             prepare()
+            if (initialPositionMs > 0) seekTo(initialPositionMs)
         }
     }
 
@@ -72,12 +93,28 @@ fun AudioLessonPlayer(url: String, modifier: Modifier = Modifier) {
         }
     }
 
+    LaunchedEffect(seekRequest?.id) {
+        seekRequest?.let {
+            player.seekTo(it.positionMs.coerceAtLeast(0))
+            position = it.positionMs.coerceAtLeast(0)
+        }
+    }
+
     LaunchedEffect(player) {
         while (true) {
             if (!dragging) {
                 position = player.currentPosition.coerceAtLeast(0)
             }
             duration = player.duration.takeUnless { it == C.TIME_UNSET }?.coerceAtLeast(0) ?: 0
+            if (
+                lastReportedDuration != duration ||
+                lastReportedPosition < 0 ||
+                kotlin.math.abs(position - lastReportedPosition) >= 1_000
+            ) {
+                lastReportedPosition = position
+                lastReportedDuration = duration
+                onProgress(position, duration)
+            }
             delay(400)
         }
     }
@@ -143,18 +180,26 @@ fun AudioLessonPlayer(url: String, modifier: Modifier = Modifier) {
                         Icon(Icons.Default.Forward10, contentDescription = "Forward ten seconds")
                     }
                 }
-                AssistChip(
-                    onClick = {
-                        speed = when (speed) {
-                            0.75f -> 1f
-                            1f -> 1.25f
-                            else -> 0.75f
-                        }
-                        player.setPlaybackSpeed(speed)
-                    },
-                    label = { Text("${speed}x") },
-                    colors = AssistChipDefaults.assistChipColors(labelColor = MaterialTheme.colorScheme.primary),
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onToggleTranscript) {
+                        Icon(
+                            if (transcriptVisible) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                            contentDescription = if (transcriptVisible) {
+                                "Hide transcript for blind listening"
+                            } else {
+                                "Show transcript"
+                            },
+                        )
+                    }
+                    AssistChip(
+                        onClick = {
+                            speed = nextPlaybackSpeed(speed)
+                            player.setPlaybackSpeed(speed)
+                        },
+                        label = { Text("${speed}x") },
+                        colors = AssistChipDefaults.assistChipColors(labelColor = MaterialTheme.colorScheme.primary),
+                    )
+                }
             }
             playbackError?.let {
                 Row(

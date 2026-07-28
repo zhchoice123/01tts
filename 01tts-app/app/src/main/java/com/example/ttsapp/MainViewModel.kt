@@ -7,20 +7,25 @@ import com.example.ttsapp.network.ContentResponse
 import com.example.ttsapp.network.CreateLongLessonRequest
 import com.example.ttsapp.network.CreateTaskRequest
 import com.example.ttsapp.network.DailyPlanResponse
+import com.example.ttsapp.network.LearningDashboardResponse
+import com.example.ttsapp.network.LearningProgressRequest
 import com.example.ttsapp.network.TaskApi
 import com.example.ttsapp.network.TaskResponse
 import com.example.ttsapp.network.TopicRecommendationResponse
+import com.example.ttsapp.network.VocabularyProgressRequest
 import java.io.File
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.RequestBody.Companion.asRequestBody
+import retrofit2.HttpException
 
 enum class LearningStep {
     CREATE,
@@ -64,6 +69,13 @@ data class LearningUiState(
     val topics: List<TopicRecommendationResponse> = emptyList(),
     val topicsLoading: Boolean = false,
     val topicsError: String? = null,
+    val clientId: String = "",
+    val currentProgress: LearningProgressRequest? = null,
+    val todayProgress: LearningProgressRequest? = null,
+    val dashboard: LearningDashboardResponse? = null,
+    val dashboardLoading: Boolean = false,
+    val learningSyncMessage: String? = null,
+    val vocabularyStatuses: Map<String, String> = emptyMap(),
 )
 
 class MainViewModel(
@@ -71,12 +83,17 @@ class MainViewModel(
     private val historyStore: LessonHistoryStore = InMemoryLessonHistoryStore(),
     private val themeStore: ThemePreferenceStore = InMemoryThemePreferenceStore(),
     private val languageStore: LanguagePreferenceStore = InMemoryLanguagePreferenceStore(),
+    private val clientIdStore: ClientIdStore = InMemoryClientIdStore(),
+    private val progressStore: LearningProgressStore = InMemoryLearningProgressStore(),
 ) : ViewModel() {
+    private val clientId = clientIdStore.loadOrCreate()
+    private var progressSaveJob: Job? = null
     private val mutableState = MutableStateFlow(
         LearningUiState(
             history = historyStore.load(),
             selectedThemeId = themeStore.load(),
             selectedLanguageId = languageStore.load(),
+            clientId = clientId,
         )
     )
     val state: StateFlow<LearningUiState> = mutableState.asStateFlow()
@@ -116,6 +133,7 @@ class MainViewModel(
                         dailyLoading = false,
                         dailyError = null,
                     )
+                    restoreProgress(it.contentUuid)
                 }
                 .onFailure {
                     mutableState.value = state.value.copy(
@@ -124,6 +142,28 @@ class MainViewModel(
                     )
                 }
             refreshLibrary()
+            refreshDashboard()
+        }
+    }
+
+    fun refreshDashboard() {
+        if (state.value.dashboardLoading) return
+        viewModelScope.launch {
+            mutableState.value = state.value.copy(dashboardLoading = true)
+            runCatching { api.learningDashboard(clientId, 7) }
+                .onSuccess {
+                    mutableState.value = state.value.copy(
+                        dashboard = it,
+                        dashboardLoading = false,
+                        learningSyncMessage = null,
+                    )
+                }
+                .onFailure {
+                    mutableState.value = state.value.copy(
+                        dashboardLoading = false,
+                        learningSyncMessage = offlineMessage(),
+                    )
+                }
         }
     }
 
@@ -274,6 +314,7 @@ class MainViewModel(
             history = history,
             step = LearningStep.LISTEN,
         )
+        restoreProgress(task.taskUuid)
     }
 
     fun openTodayLesson(): Boolean {
@@ -386,12 +427,72 @@ class MainViewModel(
             step = LearningStep.LISTEN,
             error = null,
         )
+        restoreProgress(task.taskUuid)
     }
 
     fun recordQuizResult(correct: Int, total: Int) {
         val taskUuid = state.value.task?.taskUuid ?: return
         updateHistory(taskUuid) { it.copy(quizCorrect = correct, quizTotal = total) }
         mutableState.value = state.value.copy(quizCorrect = correct, quizTotal = total)
+        updateLearningProgress {
+            it.copy(quizCorrect = correct, quizTotal = total)
+        }
+    }
+
+    fun markVocabularyDone() = updateLearningProgress { it.copy(vocabularyDone = true) }
+
+    fun reviewVocabulary(word: String, status: String) {
+        val taskUuid = state.value.task?.taskUuid ?: return
+        val normalized = status.uppercase().takeIf { it in setOf("LEARNING", "KNOWN") }
+            ?: "LEARNING"
+        mutableState.value = state.value.copy(
+            vocabularyStatuses = state.value.vocabularyStatuses + (word to normalized),
+        )
+        viewModelScope.launch {
+            runCatching {
+                api.saveVocabularyProgress(
+                    VocabularyProgressRequest(
+                        clientId = clientId,
+                        contentUuid = taskUuid,
+                        word = word,
+                        status = normalized,
+                    )
+                )
+            }.onFailure {
+                mutableState.value = state.value.copy(learningSyncMessage = offlineMessage())
+            }
+        }
+    }
+
+    fun markReadingDone() = updateLearningProgress { it.copy(readingDone = true) }
+
+    fun onPlaybackProgress(positionMs: Long, durationMs: Long) {
+        val taskUuid = state.value.task?.taskUuid ?: return
+        val current = progressFor(taskUuid)
+        val listeningDone = durationMs > 0 &&
+            (positionMs >= durationMs * 85 / 100 || durationMs - positionMs <= 30_000)
+        val updated = current.copy(
+            positionMs = positionMs.coerceAtLeast(0),
+            durationMs = durationMs.coerceAtLeast(0),
+            listeningDone = current.listeningDone || listeningDone,
+        ).withCompletion()
+        progressStore.save(updated)
+        mutableState.value = state.value.copy(
+            currentProgress = updated,
+            todayProgress = if (state.value.dailyPlan?.contentUuid == taskUuid) {
+                updated
+            } else {
+                state.value.todayProgress
+            },
+        )
+        if (progressSaveJob?.isActive != true) {
+            progressSaveJob = viewModelScope.launch {
+                delay(2_000)
+                state.value.currentProgress
+                    ?.takeIf { it.contentUuid == taskUuid }
+                    ?.let { syncProgress(it) }
+            }
+        }
     }
 
     fun continueToSpeaking() {
@@ -439,6 +540,9 @@ class MainViewModel(
             }.onSuccess {
                 updateHistory(taskUuid) { entry -> entry.copy(answer = it) }
                 mutableState.value = state.value.copy(evaluating = false, answer = it)
+                updateLearningProgress { progress ->
+                    progress.copy(speakingScore = it.score)
+                }
             }.onFailure {
                 mutableState.value = state.value.copy(
                     evaluating = false,
@@ -462,4 +566,127 @@ class MainViewModel(
         historyStore.save(history)
         mutableState.value = state.value.copy(history = history)
     }
+
+    private fun restoreProgress(contentUuid: String) {
+        val local = progressFor(contentUuid)
+        val isOpenLesson = state.value.task?.taskUuid == contentUuid
+        val isTodayLesson = state.value.dailyPlan?.contentUuid == contentUuid
+        mutableState.value = state.value.copy(
+            currentProgress = if (isOpenLesson || state.value.task == null) {
+                local
+            } else {
+                state.value.currentProgress
+            },
+            todayProgress = if (isTodayLesson) {
+                local
+            } else {
+                state.value.todayProgress
+            },
+            learningSyncMessage = null,
+        )
+        viewModelScope.launch {
+            runCatching { api.learningProgress(clientId, contentUuid) }
+                .onSuccess { remote ->
+                    val merged = remote.asRequest().copy(
+                        positionMs = maxOf(remote.positionMs, local.positionMs),
+                        durationMs = maxOf(remote.durationMs, local.durationMs),
+                        vocabularyDone = remote.vocabularyDone || local.vocabularyDone,
+                        listeningDone = remote.listeningDone || local.listeningDone,
+                        readingDone = remote.readingDone || local.readingDone,
+                        quizCorrect = maxOf(remote.quizCorrect, local.quizCorrect),
+                        quizTotal = maxOf(remote.quizTotal, local.quizTotal),
+                        speakingScore = remote.speakingScore ?: local.speakingScore,
+                        completed = remote.completed || local.completed,
+                    ).withCompletion()
+                    progressStore.save(merged)
+                    val openNow = state.value.task?.taskUuid == contentUuid
+                    val todayNow = state.value.dailyPlan?.contentUuid == contentUuid
+                    if (openNow || todayNow) {
+                        mutableState.value = state.value.copy(
+                            currentProgress = if (openNow || state.value.task == null) {
+                                merged
+                            } else {
+                                state.value.currentProgress
+                            },
+                            todayProgress = if (todayNow) {
+                                merged
+                            } else {
+                                state.value.todayProgress
+                            },
+                            learningSyncMessage = null,
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    val progressDoesNotExist = error is HttpException && error.code() == 404
+                    if (!progressDoesNotExist && state.value.task?.taskUuid == contentUuid) {
+                        mutableState.value = state.value.copy(
+                            learningSyncMessage = offlineMessage(),
+                        )
+                    }
+                }
+        }
+        viewModelScope.launch {
+            runCatching { api.learningVocabulary(clientId, null) }
+                .onSuccess { words ->
+                    if (state.value.task?.taskUuid == contentUuid) {
+                        mutableState.value = state.value.copy(
+                            vocabularyStatuses = words
+                                .filter { it.contentUuid == contentUuid }
+                                .associate { it.word to it.status },
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun updateLearningProgress(
+        transform: (LearningProgressRequest) -> LearningProgressRequest,
+    ) {
+        val taskUuid = state.value.task?.taskUuid ?: return
+        val updated = transform(progressFor(taskUuid)).withCompletion()
+        progressStore.save(updated)
+        mutableState.value = state.value.copy(
+            currentProgress = updated,
+            todayProgress = if (state.value.dailyPlan?.contentUuid == taskUuid) {
+                updated
+            } else {
+                state.value.todayProgress
+            },
+        )
+        progressSaveJob?.cancel()
+        progressSaveJob = viewModelScope.launch { syncProgress(updated) }
+    }
+
+    private fun progressFor(contentUuid: String): LearningProgressRequest =
+        state.value.currentProgress?.takeIf { it.contentUuid == contentUuid }
+            ?: progressStore.load(contentUuid)
+            ?: LearningProgressRequest(clientId = clientId, contentUuid = contentUuid)
+
+    private suspend fun syncProgress(progress: LearningProgressRequest) {
+        val safeProgress = if (progress.durationMs <= 0) {
+            progress.copy(positionMs = 0)
+        } else {
+            progress.copy(positionMs = progress.positionMs.coerceAtMost(progress.durationMs))
+        }
+        runCatching { api.saveLearningProgress(safeProgress) }
+            .onSuccess {
+                mutableState.value = state.value.copy(learningSyncMessage = null)
+            }
+            .onFailure {
+                mutableState.value = state.value.copy(learningSyncMessage = offlineMessage())
+            }
+    }
+
+    private fun LearningProgressRequest.withCompletion(): LearningProgressRequest = copy(
+        completed = vocabularyDone && listeningDone && readingDone &&
+            quizTotal > 0 && speakingScore != null,
+    )
+
+    private fun offlineMessage(): String =
+        if (state.value.selectedLanguageId == AppLanguage.CHINESE.id) {
+            "云端暂不可用，当前进度已保存在本机，联网后可继续学习。"
+        } else {
+            "Cloud sync is unavailable. Progress is saved on this device so you can keep learning."
+        }
 }

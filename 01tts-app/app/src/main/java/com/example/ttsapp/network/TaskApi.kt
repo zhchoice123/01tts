@@ -5,6 +5,7 @@ import retrofit2.http.Body
 import retrofit2.http.GET
 import retrofit2.http.Multipart
 import retrofit2.http.POST
+import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Part
 import retrofit2.http.Query
@@ -25,6 +26,7 @@ data class TaskResponse(
     val audioUrl: String? = null,
     val questions: String? = null,
     val vocabulary: String? = null,
+    val lessonContent: String? = null,
 )
 
 data class AnswerResponse(
@@ -71,9 +73,81 @@ data class ContentResponse(
             audioUrl = audioUrl,
             questions = questions,
             vocabulary = vocabulary,
+            lessonContent = lessonContent,
         )
     }
 }
+
+data class LearningProgressRequest(
+    val clientId: String,
+    val contentUuid: String,
+    val positionMs: Long = 0,
+    val durationMs: Long = 0,
+    val vocabularyDone: Boolean = false,
+    val listeningDone: Boolean = false,
+    val readingDone: Boolean = false,
+    val quizCorrect: Int = 0,
+    val quizTotal: Int = 0,
+    val speakingScore: Int? = null,
+    val completed: Boolean = false,
+)
+
+data class LearningProgressResponse(
+    val clientId: String = "",
+    val contentUuid: String = "",
+    val positionMs: Long = 0,
+    val durationMs: Long = 0,
+    val vocabularyDone: Boolean = false,
+    val listeningDone: Boolean = false,
+    val readingDone: Boolean = false,
+    val quizCorrect: Int = 0,
+    val quizTotal: Int = 0,
+    val speakingScore: Int? = null,
+    val completed: Boolean = false,
+    val updatedAt: String? = null,
+) {
+    fun asRequest() = LearningProgressRequest(
+        clientId = clientId,
+        contentUuid = contentUuid,
+        positionMs = positionMs,
+        durationMs = durationMs,
+        vocabularyDone = vocabularyDone,
+        listeningDone = listeningDone,
+        readingDone = readingDone,
+        quizCorrect = quizCorrect,
+        quizTotal = quizTotal,
+        speakingScore = speakingScore,
+        completed = completed,
+    )
+}
+
+data class LearningDashboardResponse(
+    val days: Int = 7,
+    val listeningMinutes: Int = 0,
+    val completedLessons: Int = 0,
+    val quizCorrect: Int = 0,
+    val quizTotal: Int = 0,
+    val speakingAverage: Int = 0,
+    val currentStreak: Int = 0,
+    val wordsReviewed: Int = 0,
+    val latestContentUuid: String? = null,
+    val latestPositionMs: Long = 0,
+)
+
+data class VocabularyProgressRequest(
+    val clientId: String,
+    val contentUuid: String,
+    val word: String,
+    val status: String = "LEARNING",
+)
+
+data class VocabularyProgressResponse(
+    val clientId: String = "",
+    val contentUuid: String = "",
+    val word: String = "",
+    val status: String = "LEARNING",
+    val updatedAt: String? = null,
+)
 
 data class DailyPlanResponse(
     val planDate: String,
@@ -156,4 +230,32 @@ interface TaskApi {
     suspend fun getContent(
         @Path("uuid") uuid: String,
     ): ContentResponse
+
+    @PUT("api/v1/learning/progress")
+    suspend fun saveLearningProgress(
+        @Body request: LearningProgressRequest,
+    ): LearningProgressResponse
+
+    @GET("api/v1/learning/progress/{clientId}/{contentUuid}")
+    suspend fun learningProgress(
+        @Path("clientId") clientId: String,
+        @Path("contentUuid") contentUuid: String,
+    ): LearningProgressResponse
+
+    @GET("api/v1/learning/dashboard/{clientId}")
+    suspend fun learningDashboard(
+        @Path("clientId") clientId: String,
+        @Query("days") days: Int = 7,
+    ): LearningDashboardResponse
+
+    @PUT("api/v1/learning/vocabulary")
+    suspend fun saveVocabularyProgress(
+        @Body request: VocabularyProgressRequest,
+    ): VocabularyProgressResponse
+
+    @GET("api/v1/learning/vocabulary/{clientId}")
+    suspend fun learningVocabulary(
+        @Path("clientId") clientId: String,
+        @Query("status") status: String? = null,
+    ): List<VocabularyProgressResponse>
 }

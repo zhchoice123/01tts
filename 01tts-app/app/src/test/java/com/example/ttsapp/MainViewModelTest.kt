@@ -5,10 +5,15 @@ import com.example.ttsapp.network.ContentResponse
 import com.example.ttsapp.network.CreateLongLessonRequest
 import com.example.ttsapp.network.CreateTaskRequest
 import com.example.ttsapp.network.DailyPlanResponse
+import com.example.ttsapp.network.LearningDashboardResponse
+import com.example.ttsapp.network.LearningProgressRequest
+import com.example.ttsapp.network.LearningProgressResponse
 import com.example.ttsapp.network.TaskApi
 import com.example.ttsapp.network.TaskResponse
 import com.example.ttsapp.network.TopicLessonResponse
 import com.example.ttsapp.network.TopicRecommendationResponse
+import com.example.ttsapp.network.VocabularyProgressRequest
+import com.example.ttsapp.network.VocabularyProgressResponse
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -18,6 +23,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
 import okhttp3.MultipartBody
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -26,6 +32,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import retrofit2.HttpException
+import retrofit2.Response
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class MainViewModelTest {
@@ -190,11 +198,79 @@ class MainViewModelTest {
         assertEquals("topic-content-1", model.state.value.task?.taskUuid)
     }
 
+    @Test
+    fun readyLessonRestoresRemotePlaybackAndSavesFiveStepProgress() = runTest(dispatcher) {
+        val api = FakeTaskApi()
+        val model = MainViewModel(
+            api = api,
+            clientIdStore = InMemoryClientIdStore("00000000-0000-4000-8000-000000000042"),
+        )
+
+        model.refreshDaily()
+        advanceUntilIdle()
+        assertEquals(42_000L, model.state.value.currentProgress?.positionMs)
+        assertEquals(31, model.state.value.dashboard?.listeningMinutes)
+
+        assertTrue(model.openTodayLesson())
+        advanceUntilIdle()
+        model.markVocabularyDone()
+        model.markReadingDone()
+        model.recordQuizResult(4, 5)
+        model.onPlaybackProgress(90_000, 100_000)
+        advanceUntilIdle()
+
+        assertTrue(api.savedProgress.any { it.vocabularyDone })
+        assertTrue(model.state.value.currentProgress?.readingDone == true)
+        assertTrue(model.state.value.currentProgress?.listeningDone == true)
+        assertEquals(5, model.state.value.currentProgress?.quizTotal)
+    }
+
+    @Test
+    fun cloudFailureKeepsLocalProgressAndShowsOfflineMessage() = runTest(dispatcher) {
+        val api = FakeTaskApi().apply { failLearningApi = true }
+        val local = InMemoryLearningProgressStore().apply {
+            save(
+                LearningProgressRequest(
+                    clientId = "offline-client",
+                    contentUuid = "daily-1",
+                    positionMs = 73_000,
+                )
+            )
+        }
+        val model = MainViewModel(
+            api = api,
+            clientIdStore = InMemoryClientIdStore("offline-client"),
+            progressStore = local,
+        )
+
+        model.refreshDaily()
+        advanceUntilIdle()
+
+        assertEquals(73_000L, model.state.value.currentProgress?.positionMs)
+        assertNotNull(model.state.value.learningSyncMessage)
+        assertTrue(model.openTodayLesson())
+    }
+
+    @Test
+    fun missingRemoteProgressIsNotReportedAsOffline() = runTest(dispatcher) {
+        val api = FakeTaskApi().apply { missingLearningProgress = true }
+        val model = MainViewModel(api)
+
+        model.refreshDaily()
+        advanceUntilIdle()
+
+        assertNull(model.state.value.learningSyncMessage)
+        assertEquals(0L, model.state.value.currentProgress?.positionMs)
+    }
+
     private class FakeTaskApi : TaskApi {
         var created: CreateTaskRequest? = null
         var createdLong: CreateLongLessonRequest? = null
         var pollCount = 0
         var contentPollCount = 0
+        var failLearningApi = false
+        var missingLearningProgress = false
+        val savedProgress = mutableListOf<LearningProgressRequest>()
 
         override suspend fun create(request: CreateTaskRequest): TaskResponse {
             created = request
@@ -252,6 +328,66 @@ class MainViewModelTest {
             return topicContent()
         }
 
+        override suspend fun saveLearningProgress(
+            request: LearningProgressRequest,
+        ): LearningProgressResponse {
+            if (failLearningApi) error("offline")
+            savedProgress += request
+            return request.asResponse()
+        }
+
+        override suspend fun learningProgress(
+            clientId: String,
+            contentUuid: String,
+        ): LearningProgressResponse {
+            if (failLearningApi) error("offline")
+            if (missingLearningProgress) {
+                throw HttpException(
+                    Response.error<LearningProgressResponse>(
+                        404,
+                        "missing".toResponseBody(),
+                    )
+                )
+            }
+            return LearningProgressResponse(
+                clientId = clientId,
+                contentUuid = contentUuid,
+                positionMs = 42_000,
+                durationMs = 100_000,
+            )
+        }
+
+        override suspend fun learningDashboard(
+            clientId: String,
+            days: Int,
+        ): LearningDashboardResponse {
+            if (failLearningApi) error("offline")
+            return LearningDashboardResponse(
+                days = days,
+                listeningMinutes = 31,
+                completedLessons = 2,
+                quizCorrect = 8,
+                quizTotal = 10,
+                speakingAverage = 84,
+                currentStreak = 3,
+                wordsReviewed = 17,
+            )
+        }
+
+        override suspend fun saveVocabularyProgress(
+            request: VocabularyProgressRequest,
+        ): VocabularyProgressResponse = VocabularyProgressResponse(
+            clientId = request.clientId,
+            contentUuid = request.contentUuid,
+            word = request.word,
+            status = request.status,
+        )
+
+        override suspend fun learningVocabulary(
+            clientId: String,
+            status: String?,
+        ): List<VocabularyProgressResponse> = emptyList()
+
         private fun dailyContent() = ContentResponse(
             uuid = "daily-1",
             title = "Virtual threads in practice",
@@ -260,7 +396,7 @@ class MainViewModelTest {
             level = "B1",
             status = "READY",
             audioUrl = "/audio/daily-1.mp3",
-            lessonContent = """{"passage":"Virtual threads make blocking code easier to scale.","questions":[]}""",
+            lessonContent = """{"passage":"Virtual threads make blocking code easier to scale.","questions":[],"dialogue":[{"speaker":"HOST","text":"Why virtual threads?","startMs":0,"endMs":2100},{"speaker":"EXPERT","text":"They simplify blocking I/O.","startMs":2100,"endMs":4900}]}""",
         )
 
         private fun longContent() = ContentResponse(
@@ -307,6 +443,20 @@ class MainViewModelTest {
             voice = "en-US-AndrewNeural",
             difficulty = "hard",
             status = status,
+        )
+
+        private fun LearningProgressRequest.asResponse() = LearningProgressResponse(
+            clientId = clientId,
+            contentUuid = contentUuid,
+            positionMs = positionMs,
+            durationMs = durationMs,
+            vocabularyDone = vocabularyDone,
+            listeningDone = listeningDone,
+            readingDone = readingDone,
+            quizCorrect = quizCorrect,
+            quizTotal = quizTotal,
+            speakingScore = speakingScore,
+            completed = completed,
         )
     }
 }
