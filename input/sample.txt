@@ -1,0 +1,5 @@
+Welcome to the Edge TTS Text-to-Speech system!
+
+This project allows you to seamlessly read any text file from the input directory and transform it into natural, high-quality English audio powered by Microsoft Edge's Neural TTS models.
+
+Enjoy listening to your generated audio files!

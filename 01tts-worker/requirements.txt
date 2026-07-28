@@ -1,0 +1,11 @@
+edge-tts>=7.0.0
+APScheduler>=3.10.4
+fastapi>=0.115.0
+httpx>=0.27.0
+PyMySQL>=1.1.1
+redis>=5.0.0
+requests>=2.31.0
+PyYAML>=6.0.0
+python-multipart>=0.0.9
+SQLAlchemy>=2.0.36
+uvicorn[standard]>=0.32.0

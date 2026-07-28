@@ -1,0 +1,25 @@
+redis:
+  url: redis://127.0.0.1:6379/0
+  password: replace-with-your-redis-password
+
+server:
+  url: http://127.0.0.1:8080
+
+# The unified API creates the daily technical dialogue at 06:00 Asia/Shanghai.
+# Override with DAILY_PLAN_HOUR, DAILY_PLAN_MINUTE, and APP_TIMEZONE.
+
+moonshot:
+  model: kimi-k3
+
+# Optional override. When omitted, the worker rotates the official backend feeds
+# defined in src/config.py.
+news:
+  sources:
+    - https://spring.io/blog.atom
+    - https://inside.java/feed.xml
+    - https://github.blog/engineering/feed/
+    - https://kubernetes.io/feed.xml
+    - https://aws.amazon.com/blogs/architecture/feed/
+    - https://blog.cloudflare.com/rss/
+    - https://martinfowler.com/feed.atom
+    - https://www.postgresql.org/news.rss

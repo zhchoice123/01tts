@@ -1,0 +1,16 @@
+[Unit]
+Description=Listening Lab speaking assessment worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=01tts
+WorkingDirectory=/opt/01tts/01tts-worker
+EnvironmentFile=/etc/01tts-worker.env
+ExecStart=/opt/01tts/venv/bin/python -u worker.py --speaking --config config.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
