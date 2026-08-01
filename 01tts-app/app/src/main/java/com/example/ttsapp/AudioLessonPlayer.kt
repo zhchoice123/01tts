@@ -1,5 +1,6 @@
 package com.example.ttsapp
 
+import com.example.ttsapp.network.ApiClient
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -38,7 +39,10 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.okhttp.OkHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import kotlinx.coroutines.delay
 
 data class PlaybackSeekRequest(val id: Long, val positionMs: Long)
@@ -49,6 +53,7 @@ internal fun nextPlaybackSpeed(current: Float): Float = when (current) {
     else -> 0.8f
 }
 
+@androidx.annotation.OptIn(UnstableApi::class)
 @Composable
 fun AudioLessonPlayer(
     url: String,
@@ -56,6 +61,7 @@ fun AudioLessonPlayer(
     transcriptVisible: Boolean = true,
     seekRequest: PlaybackSeekRequest? = null,
     onToggleTranscript: () -> Unit = {},
+    onPositionChanged: (positionMs: Long) -> Unit = {},
     onProgress: (positionMs: Long, durationMs: Long) -> Unit = { _, _ -> },
     modifier: Modifier = Modifier,
 ) {
@@ -69,11 +75,17 @@ fun AudioLessonPlayer(
     var lastReportedPosition by remember(url) { mutableLongStateOf(-1L) }
     var lastReportedDuration by remember(url) { mutableLongStateOf(-1L) }
     val player = remember(url) {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(url))
-            prepare()
-            if (initialPositionMs > 0) seekTo(initialPositionMs)
-        }
+        val mediaSourceFactory = DefaultMediaSourceFactory(
+            OkHttpDataSource.Factory(ApiClient.httpClient),
+        )
+        ExoPlayer.Builder(context)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build()
+            .apply {
+                setMediaItem(MediaItem.fromUri(url))
+                prepare()
+                if (initialPositionMs > 0) seekTo(initialPositionMs)
+            }
     }
 
     DisposableEffect(player) {
@@ -104,6 +116,7 @@ fun AudioLessonPlayer(
         while (true) {
             if (!dragging) {
                 position = player.currentPosition.coerceAtLeast(0)
+                onPositionChanged(position)
             }
             duration = player.duration.takeUnless { it == C.TIME_UNSET }?.coerceAtLeast(0) ?: 0
             if (
@@ -115,7 +128,7 @@ fun AudioLessonPlayer(
                 lastReportedDuration = duration
                 onProgress(position, duration)
             }
-            delay(400)
+            delay(if (playing) 100 else 250)
         }
     }
 
@@ -140,10 +153,12 @@ fun AudioLessonPlayer(
                 onValueChange = {
                     dragging = true
                     position = it.toLong()
+                    onPositionChanged(position)
                 },
                 onValueChangeFinished = {
                     player.seekTo(position)
                     dragging = false
+                    onPositionChanged(position)
                 },
                 valueRange = 0f..duration.coerceAtLeast(1).toFloat(),
             )

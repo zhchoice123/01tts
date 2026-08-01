@@ -35,6 +35,35 @@ class DeepSeekServiceTest(unittest.TestCase):
         self.assertEqual("Records, classes, and data", parsed["title"])
         self.assertEqual("Use }, in text", parsed["passage"])
 
+    @patch("src.deepseek_service.time.sleep")
+    @patch("src.deepseek_service.requests.post")
+    def test_deepseek_dialogue_retries_malformed_json_once(
+        self,
+        mock_post,
+        mock_sleep,
+    ):
+        malformed = Mock()
+        malformed.raise_for_status.return_value = None
+        malformed.json.return_value = {
+            "choices": [{"message": {"content": '{"dialogue": ['}}]
+        }
+        valid = Mock()
+        valid.raise_for_status.return_value = None
+        valid.json.return_value = {
+            "choices": [{"message": {"content": '{"dialogue": []}'}}]
+        }
+        mock_post.side_effect = [malformed, valid]
+
+        result = DeepSeekService(api_key="test-key")._generate_dialogue_json(
+            "Create a dialogue",
+            max_tokens=6000,
+            max_retries=1,
+        )
+
+        self.assertEqual([], result["dialogue"])
+        self.assertEqual(2, mock_post.call_count)
+        mock_sleep.assert_called_once()
+
     @patch("src.deepseek_service.requests.post")
     def test_kimi_k3_uses_supported_temperature(self, mock_post):
         mock_response = Mock()
@@ -150,9 +179,9 @@ class DeepSeekServiceTest(unittest.TestCase):
         turns = [
             {
                 "speaker": "HOST" if index % 2 == 0 else "EXPERT",
-                "text": " ".join(["backend"] * 63),
+                "text": " ".join(["backend"] * 50),
             }
-            for index in range(20)
+            for index in range(16)
         ]
         payload = {
             "title": "Production Database Latency",
@@ -169,7 +198,7 @@ class DeepSeekServiceTest(unittest.TestCase):
                     "collocations": [],
                     "usageNotes": "",
                 }
-                for i in range(12)
+                for i in range(10)
             ],
             "questions": [
                 {
@@ -198,14 +227,60 @@ class DeepSeekServiceTest(unittest.TestCase):
         )
 
         self.assertEqual("DIALOGUE", lesson["format"])
-        self.assertEqual(1260, lesson["wordCount"])
+        self.assertEqual(800, lesson["wordCount"])
         self.assertIn("Host:", lesson["passage"])
         self.assertIn("Expert:", lesson["passage"])
-        self.assertEqual(20, len(lesson["dialogue"]))
+        self.assertEqual(16, len(lesson["dialogue"]))
         self.assertEqual(
-            8192,
+            7200,
             mock_post.call_args.kwargs["json"]["max_tokens"],
         )
+
+    @patch("src.deepseek_service.requests.post")
+    def test_dialogue_refinement_reuses_short_draft_with_exact_turn_budget(self, mock_post):
+        def payload(words_per_turn):
+            return {
+                "title": "Reliable Queues",
+                "level": "B1",
+                "dialogue": [
+                    {
+                        "speaker": "HOST" if index % 2 == 0 else "EXPERT",
+                        "text": " ".join(["queue"] * words_per_turn),
+                    }
+                    for index in range(16)
+                ],
+                "simplifiedPassage": "A queue discussion.",
+                "vocabulary": [
+                    {"word": f"term{i}", "definition": "definition"}
+                    for i in range(10)
+                ],
+                "questions": [
+                    {"prompt": f"Question {i}", "options": ["A"], "answer": "A"}
+                    for i in range(5)
+                ],
+                "speakingPrompts": ["Explain queues.", "Describe a retry."],
+                "writingPrompts": ["Write a runbook."],
+            }
+
+        responses = []
+        for lesson in (payload(25), payload(50)):
+            response = Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {
+                "choices": [{"message": {"content": json.dumps(lesson)}}]
+            }
+            responses.append(response)
+        mock_post.side_effect = responses
+
+        lesson = DeepSeekService(api_key="test-key").generate_dialogue_lesson(
+            "Explain reliable queues",
+            max_retries=1,
+        )
+
+        self.assertEqual(800, lesson["wordCount"])
+        refinement_prompt = mock_post.call_args_list[1].kwargs["json"]["messages"][1]["content"]
+        self.assertIn("Previous draft", refinement_prompt)
+        self.assertIn("exactly 16", refinement_prompt)
 
 
 if __name__ == "__main__":

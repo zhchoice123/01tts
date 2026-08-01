@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 import shutil
@@ -20,6 +21,7 @@ from src.backend_service import BackendService
 
 LOGGER = logging.getLogger("tts-python-api")
 UUID_FILE_PATTERN = re.compile(r"^[0-9a-fA-F-]{36}\.(?:mp3|m4a)$")
+APK_FILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.apk$")
 
 
 class CreateTaskRequest(BaseModel):
@@ -126,6 +128,19 @@ class CreateAnkiReviewLessonRequest(BaseModel):
     topicMode: str = Field(default="DAILY_RECOMMENDED", max_length=32)
     topicId: str | None = Field(default=None, max_length=36)
     words: list[AnkiReviewWordRequest] = Field(min_length=1, max_length=30)
+
+
+class AppReleaseManifest(BaseModel):
+    versionCode: int = Field(ge=1)
+    versionName: str = Field(min_length=1, max_length=40)
+    minimumVersionCode: int = Field(default=1, ge=1)
+    mandatory: bool = False
+    title: str = Field(default="Listening Lab update", min_length=1, max_length=100)
+    changelog: list[str] = Field(default_factory=list, max_length=20)
+    apkUrl: str = Field(min_length=1, max_length=500)
+    sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    sizeBytes: int = Field(gt=0)
+    publishedAt: str = Field(min_length=1, max_length=80)
 
 
 def build_service(config: BackendConfig) -> BackendService:
@@ -328,6 +343,33 @@ def create_app(
         days: Annotated[int, Query(ge=1, le=90)] = 7,
     ) -> dict[str, Any]:
         return backend(request).learning_dashboard(str(client_id), days)
+
+    @app.get("/api/v1/learning/reports/{client_id}/{content_uuid}")
+    def get_lesson_review_report(
+        client_id: UUID,
+        content_uuid: UUID,
+        request: Request,
+    ) -> dict[str, Any]:
+        report = backend(request).lesson_review_report(
+            str(client_id),
+            str(content_uuid),
+        )
+        if not report:
+            raise HTTPException(404, "learning progress not found")
+        return report
+
+    @app.get("/api/v1/learning/review-queue/{client_id}")
+    def get_learning_review_queue(
+        client_id: UUID,
+        request: Request,
+        review_date: Annotated[date, Query(alias="date")],
+        limit: Annotated[int, Query(ge=1, le=50)] = 10,
+    ) -> dict[str, Any]:
+        return backend(request).learning_review_queue(
+            str(client_id),
+            review_date,
+            limit,
+        )
 
     @app.put("/api/v1/learning/vocabulary")
     def put_vocabulary_progress(
@@ -570,6 +612,39 @@ def create_app(
     @app.get("/api/v1/audio/content/{file_name}")
     def content_audio(file_name: str, request: Request):
         return audio_response(backend(request).content_audio_dir, file_name, "audio/mpeg")
+
+    @app.get("/api/v1/app/releases/latest")
+    def latest_app_release(request: Request) -> dict[str, Any]:
+        manifest_path = backend(request).app_release_dir / "latest.json"
+        if not manifest_path.is_file():
+            raise HTTPException(404, "no app release has been published")
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = AppReleaseManifest.model_validate(payload)
+        except (OSError, json.JSONDecodeError, ValueError) as error:
+            LOGGER.error("Invalid app release manifest: %s", error)
+            raise HTTPException(503, "app release manifest is invalid") from error
+        expected_name = manifest.apkUrl.rsplit("/", 1)[-1]
+        if not APK_FILE_PATTERN.fullmatch(expected_name):
+            raise HTTPException(503, "app release download path is invalid")
+        if not (backend(request).app_release_dir / expected_name).is_file():
+            raise HTTPException(503, "app release APK is missing")
+        return manifest.model_dump()
+
+    @app.get("/api/v1/app/releases/{file_name}")
+    def download_app_release(file_name: str, request: Request) -> FileResponse:
+        if not APK_FILE_PATTERN.fullmatch(file_name):
+            raise HTTPException(400, "invalid APK file name")
+        directory = backend(request).app_release_dir.resolve()
+        path = (directory / file_name).resolve()
+        if path.parent != directory or not path.is_file():
+            raise HTTPException(404, f"APK {file_name} not found")
+        return FileResponse(
+            path,
+            media_type="application/vnd.android.package-archive",
+            filename=file_name,
+            headers={"Cache-Control": "no-cache"},
+        )
 
     return app
 

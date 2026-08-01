@@ -8,7 +8,7 @@ class ApiClientTest {
     @Test
     fun relativeMediaUrlUsesConfiguredServer() {
         assertEquals(
-            "${ApiClient.FALLBACK_BASE_URL}audio/lesson.mp3",
+            "${ApiClient.BASE_URL}audio/lesson.mp3",
             ApiClient.resolveMediaUrl("/audio/lesson.mp3"),
         )
     }

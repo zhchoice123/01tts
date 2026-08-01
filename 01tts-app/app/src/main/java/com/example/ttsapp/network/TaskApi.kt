@@ -1,5 +1,8 @@
 package com.example.ttsapp.network
 
+import com.example.ttsapp.review.LessonReviewReportResponse
+import com.example.ttsapp.review.ReviewQueueResponse
+import com.google.gson.JsonParser
 import okhttp3.MultipartBody
 import retrofit2.http.Body
 import retrofit2.http.GET
@@ -9,7 +12,6 @@ import retrofit2.http.PUT
 import retrofit2.http.Path
 import retrofit2.http.Part
 import retrofit2.http.Query
-import com.google.gson.JsonParser
 
 data class CreateTaskRequest(
     val prompt: String,
@@ -37,6 +39,25 @@ data class AnswerResponse(
     val transcript: String? = null,
     val score: Int? = null,
     val feedback: String? = null,
+    val failureReason: String? = null,
+    val evaluation: SpeakingEvaluation? = null,
+)
+
+data class SpeakingEvaluation(
+    val overallScore: Int = 0,
+    val pronunciationScore: Int = 0,
+    val fluencyScore: Int = 0,
+    val intonationScore: Int = 0,
+    val pacingScore: Int = 0,
+    val relevanceScore: Int = 0,
+    val grammarScore: Int = 0,
+    val vocabularyScore: Int = 0,
+    val summary: String = "",
+    val strengths: List<String> = emptyList(),
+    val improvements: List<String> = emptyList(),
+    val practicePlan: List<String> = emptyList(),
+    val mode: String = "",
+    val model: String = "",
 )
 
 data class ContentResponse(
@@ -187,6 +208,19 @@ data class TopicLessonResponse(
     val content: ContentResponse,
 )
 
+data class AppReleaseResponse(
+    val versionCode: Int,
+    val versionName: String,
+    val minimumVersionCode: Int = 1,
+    val mandatory: Boolean = false,
+    val title: String = "Listening Lab update",
+    val changelog: List<String> = emptyList(),
+    val apkUrl: String,
+    val sha256: String,
+    val sizeBytes: Long,
+    val publishedAt: String,
+)
+
 interface TaskApi {
     @POST("api/v1/tasks")
     suspend fun create(@Body request: CreateTaskRequest): TaskResponse
@@ -258,4 +292,20 @@ interface TaskApi {
         @Path("clientId") clientId: String,
         @Query("status") status: String? = null,
     ): List<VocabularyProgressResponse>
+
+    @GET("api/v1/learning/reports/{clientId}/{contentUuid}")
+    suspend fun lessonReviewReport(
+        @Path("clientId") clientId: String,
+        @Path("contentUuid") contentUuid: String,
+    ): LessonReviewReportResponse
+
+    @GET("api/v1/learning/review-queue/{clientId}")
+    suspend fun reviewQueue(
+        @Path("clientId") clientId: String,
+        @Query("date") date: String,
+        @Query("limit") limit: Int = 10,
+    ): ReviewQueueResponse
+
+    @GET("api/v1/app/releases/latest")
+    suspend fun latestAppRelease(): AppReleaseResponse
 }

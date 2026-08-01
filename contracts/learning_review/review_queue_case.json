@@ -1,0 +1,100 @@
+{
+  "case": "daily queue contains due lesson and vocabulary reviews",
+  "inputs": {
+    "clientId": "11111111-1111-4111-8111-111111111111",
+    "asOf": "2026-08-01T12:00:00Z",
+    "limit": 10,
+    "vocabularyProgress": [
+      {
+        "contentUuid": "22222222-2222-4222-8222-222222222222",
+        "word": "latency",
+        "status": "NEW",
+        "updatedAt": "2026-08-01T12:00:00Z"
+      },
+      {
+        "contentUuid": "22222222-2222-4222-8222-222222222222",
+        "word": "trade-off",
+        "status": "LEARNING",
+        "updatedAt": "2026-07-31T11:00:00Z"
+      },
+      {
+        "contentUuid": "33333333-3333-4333-8333-333333333333",
+        "word": "resilient",
+        "status": "KNOWN",
+        "updatedAt": "2026-07-25T10:00:00Z"
+      },
+      {
+        "contentUuid": "33333333-3333-4333-8333-333333333333",
+        "word": "future",
+        "status": "LEARNING",
+        "updatedAt": "2026-08-01T11:30:00Z"
+      }
+    ],
+    "courseWeaknesses": [
+      {
+        "id": "lesson-review-1",
+        "contentUuid": "22222222-2222-4222-8222-222222222222",
+        "title": "Replay the difficult section",
+        "reason": "Listening completion is below target.",
+        "priority": 1,
+        "dueAt": "2026-08-01T08:00:00Z"
+      }
+    ]
+  },
+  "expected": {
+    "clientId": "11111111-1111-4111-8111-111111111111",
+    "date": "2026-08-01",
+    "totalCount": 4,
+    "estimatedMinutes": 4,
+    "items": [
+      {
+        "id": "lesson-review-1",
+        "type": "LESSON",
+        "contentUuid": "22222222-2222-4222-8222-222222222222",
+        "title": "Replay the difficult section",
+        "reason": "Listening completion is below target.",
+        "priority": 1,
+        "dueAt": "2026-08-01T08:00:00Z",
+        "word": null,
+        "status": "NEEDS_REVIEW",
+        "action": "REVIEW_LESSON"
+      },
+      {
+        "id": "vocabulary-b0b7026d604ab516a1ee",
+        "type": "VOCABULARY",
+        "contentUuid": "22222222-2222-4222-8222-222222222222",
+        "title": "trade-off",
+        "reason": "Vocabulary is due for a one-day follow-up.",
+        "priority": 2,
+        "dueAt": "2026-08-01T11:00:00Z",
+        "word": "trade-off",
+        "status": "LEARNING",
+        "action": "REVIEW_WORD"
+      },
+      {
+        "id": "vocabulary-15591821e3f6994ecafb",
+        "type": "VOCABULARY",
+        "contentUuid": "33333333-3333-4333-8333-333333333333",
+        "title": "resilient",
+        "reason": "Known vocabulary is due for a seven-day refresh.",
+        "priority": 3,
+        "dueAt": "2026-08-01T10:00:00Z",
+        "word": "resilient",
+        "status": "KNOWN",
+        "action": "REVIEW_WORD"
+      },
+      {
+        "id": "vocabulary-7bf460bfacd373f0b8e2",
+        "type": "VOCABULARY",
+        "contentUuid": "22222222-2222-4222-8222-222222222222",
+        "title": "latency",
+        "reason": "New vocabulary is ready for its first review.",
+        "priority": 1,
+        "dueAt": "2026-08-01T12:00:00Z",
+        "word": "latency",
+        "status": "NEW",
+        "action": "REVIEW_WORD"
+      }
+    ]
+  }
+}

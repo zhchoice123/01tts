@@ -11,6 +11,15 @@ from src.schema_validator import validate_and_repair_lesson_content
 
 LOGGER = logging.getLogger("tts-worker.deepseek")
 
+DIALOGUE_TARGET_MIN_WORDS = 800
+DIALOGUE_TARGET_MAX_WORDS = 950
+DIALOGUE_ACCEPT_MIN_WORDS = 700
+DIALOGUE_ACCEPT_MAX_WORDS = 1050
+DIALOGUE_TARGET_MIN_TURNS = 14
+DIALOGUE_TARGET_MAX_TURNS = 18
+DIALOGUE_ACCEPT_MIN_TURNS = 10
+DIALOGUE_ACCEPT_MAX_TURNS = 24
+
 LESSON_SYSTEM_PROMPT = """Return JSON only adhering strictly to the LessonContent schema:
 {
   "title": "Short Title",
@@ -41,7 +50,9 @@ LESSON_SYSTEM_PROMPT = """Return JSON only adhering strictly to the LessonConten
   "writingPrompts": ["Write 80-120 words explaining how you would use this idea."]
 }
 Do not wrap the object in Markdown. Use double-quoted property names and values.
-Do not add comments or trailing commas.
+Do not add comments or trailing commas. Keep every string on one JSON-safe line;
+escape any double quote inside a value and never stop before the final closing brace.
+Before responding, silently verify that the JSON parses and every required array exists.
 """
 
 LONG_LESSON_SYSTEM_PROMPT = """Return JSON only. Create a rigorous English lesson for
@@ -74,11 +85,14 @@ at least 2 speaking prompts, and at least 1 writing prompt. Do not use Markdown
 outside JSON. Do not invent claims about a supplied source; attribute and summarize it.
 """
 
-DIALOGUE_LESSON_SYSTEM_PROMPT = """Return JSON only. Create a natural technical
+DIALOGUE_LESSON_SYSTEM_PROMPT = """Return one complete, valid JSON object only. Create a natural technical
 English podcast dialogue for an experienced backend developer. Use exactly two
 speakers: HOST asks focused questions and EXPERT gives practical, technically accurate
-answers. The dialogue text MUST contain 1250-1450 English words in 18-26 alternating
-turns, begin with HOST, and end with a concise EXPERT recap. Use clear B1-B2 English.
+answers. Produce exactly 16 alternating turns: 8 HOST turns and 8 EXPERT turns. Begin
+with HOST and end with a concise EXPERT recap. Each HOST turn should contain 15-25
+English words and each EXPERT turn should contain 80-95 English words, for 800-950
+spoken words in total. This should produce about 5-8 minutes of speech. Use clear B1-B2
+English. Do not put speaker labels inside the text value.
 
 Return this shape:
 {
@@ -88,7 +102,7 @@ Return this shape:
     {"speaker": "HOST", "text": "Question or transition."},
     {"speaker": "EXPERT", "text": "Detailed answer with an example."}
   ],
-  "simplifiedPassage": "A 180-260 word recap",
+  "simplifiedPassage": "A 120-180 word recap",
   "vocabulary": [{
     "word": "backpressure", "phonetic": "", "definition": "English definition",
     "meaningZh": "中文释义", "example": "Technical example sentence.",
@@ -103,10 +117,13 @@ Return this shape:
 }
 Cover an opening production problem, technical background, architecture and core
 principles, a concrete Java or Spring example, trade-offs, operations, and a recap.
-Include 12-18 vocabulary items, exactly 5 reading questions, at least 2 speaking
+Include 8-12 vocabulary items, exactly 5 reading questions, at least 2 speaking
 prompts, and at least 1 writing prompt. Do not include a passage field; it will be
 constructed from the dialogue. Do not use Markdown outside JSON. Do not invent claims
-about a supplied source.
+about a supplied source. Keep every string JSON-safe: escape embedded double quotes,
+do not use literal newlines inside strings, do not add trailing commas, and always emit
+the final closing brace. Before responding, silently count the 16 turns and spoken words
+and verify that the object parses as JSON.
 """
 
 
@@ -309,26 +326,30 @@ class DeepSeekService:
         metadata: dict[str, Any] | None = None,
         max_retries: int = 2,
     ) -> dict[str, Any]:
-        """Generate and validate a two-speaker 10-minute technical dialogue."""
+        """Generate and validate a two-speaker 5-8 minute technical dialogue."""
         meta = metadata or {}
         dialogue = self._generate_dialogue_json(
             prompt,
-            max_tokens=8192,
+            max_tokens=7200,
             max_retries=max_retries,
         )
         issues = self._dialogue_lesson_issues(dialogue)
         if issues:
             LOGGER.info("Refining dialogue lesson issues=%s", issues)
+            previous_dialogue = json.dumps(dialogue, ensure_ascii=False)
             dialogue = self._generate_dialogue_json(
                 (
-                    "The previous dialogue did not meet these requirements: "
-                    f"{'; '.join(issues)}. Rewrite the COMPLETE JSON object. Keep exactly "
-                    "two alternating speakers named HOST and EXPERT, use 18-26 turns, "
-                    "and make the combined spoken text 1250-1450 English words. Preserve "
-                    "the topic and source attribution. Previous JSON:\n"
-                    + json.dumps(dialogue, ensure_ascii=False)
+                    "The first draft failed validation because: "
+                    f"{'; '.join(issues)}. Rewrite the complete draft below while "
+                    "preserving its accurate content. Use exactly 16 alternating "
+                    "HOST/EXPERT turns: each HOST turn 15-25 words and each EXPERT turn "
+                    "80-95 words. Target 850-900 combined spoken English words. Expand "
+                    "or condense the EXPERT explanations instead of adding extra turns. "
+                    "Return one complete parseable JSON object and satisfy every schema "
+                    "field.\nOriginal request:\n"
+                    f"{prompt}\nPrevious draft:\n{previous_dialogue}"
                 ),
-                max_tokens=8192,
+                max_tokens=7200,
                 max_retries=max_retries,
             )
         remaining_issues = self._dialogue_lesson_issues(dialogue)
@@ -379,7 +400,7 @@ class DeepSeekService:
         if not isinstance(turns, list):
             return ["dialogue is not a list"]
         issues = []
-        if not 18 <= len(turns) <= 26:
+        if not DIALOGUE_ACCEPT_MIN_TURNS <= len(turns) <= DIALOGUE_ACCEPT_MAX_TURNS:
             issues.append(f"dialogue has {len(turns)} turns")
         spoken_parts = []
         for index, turn in enumerate(turns):
@@ -397,9 +418,9 @@ class DeepSeekService:
                 issues.append(f"dialogue turn {index} text is empty")
             spoken_parts.append(text)
         word_count = count_english_words(" ".join(spoken_parts))
-        if not 1250 <= word_count <= 1450:
+        if not DIALOGUE_ACCEPT_MIN_WORDS <= word_count <= DIALOGUE_ACCEPT_MAX_WORDS:
             issues.append(f"dialogue has {word_count} spoken words")
-        if len(lesson.get("vocabulary") or []) not in range(12, 19):
+        if len(lesson.get("vocabulary") or []) not in range(8, 13):
             issues.append(
                 f"vocabulary has {len(lesson.get('vocabulary') or [])} items"
             )
@@ -422,7 +443,12 @@ class DeepSeekService:
         max_retries: int,
     ) -> dict[str, Any]:
         last_error = None
-        for attempt in range(1, max_retries + 1):
+        attempt_limit = (
+            max(2, max_retries)
+            if not self.model.startswith("kimi-")
+            else max_retries
+        )
+        for attempt in range(1, attempt_limit + 1):
             try:
                 response = requests.post(
                     f"{self.base_url}/chat/completions",
@@ -453,10 +479,10 @@ class DeepSeekService:
                 LOGGER.warning(
                     "Dialogue generation attempt %d/%d failed: %s",
                     attempt,
-                    max_retries,
+                    attempt_limit,
                     error,
                 )
-                if attempt < max_retries:
+                if attempt < attempt_limit:
                     time.sleep(1.5 * attempt)
         raise RuntimeError(f"Failed to generate dialogue lesson: {last_error}")
 

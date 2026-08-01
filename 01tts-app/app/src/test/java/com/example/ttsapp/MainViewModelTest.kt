@@ -1,6 +1,7 @@
 package com.example.ttsapp
 
 import com.example.ttsapp.network.AnswerResponse
+import com.example.ttsapp.network.AppReleaseResponse
 import com.example.ttsapp.network.ContentResponse
 import com.example.ttsapp.network.CreateLongLessonRequest
 import com.example.ttsapp.network.CreateTaskRequest
@@ -14,6 +15,11 @@ import com.example.ttsapp.network.TopicLessonResponse
 import com.example.ttsapp.network.TopicRecommendationResponse
 import com.example.ttsapp.network.VocabularyProgressRequest
 import com.example.ttsapp.network.VocabularyProgressResponse
+import com.example.ttsapp.review.LessonReviewReportResponse
+import com.example.ttsapp.review.ReviewContentState
+import com.example.ttsapp.review.ReviewDimension
+import com.example.ttsapp.review.ReviewQueueItem
+import com.example.ttsapp.review.ReviewQueueResponse
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -263,6 +269,128 @@ class MainViewModelTest {
         assertEquals(0L, model.state.value.currentProgress?.positionMs)
     }
 
+    @Test
+    fun refreshDailyLoadsReviewQueueWithoutCouplingItsFailureToDailyLesson() = runTest(dispatcher) {
+        val api = FakeTaskApi().apply { failReviewQueue = true }
+        val model = MainViewModel(
+            api = api,
+            currentDate = { "2026-08-01" },
+        )
+
+        model.refreshDaily()
+        assertTrue(model.state.value.reviewQueueState is ReviewContentState.Loading)
+        advanceUntilIdle()
+
+        assertEquals("daily-1", model.state.value.dailyPlan?.contentUuid)
+        assertNull(model.state.value.dailyError)
+        assertTrue(model.state.value.reviewQueueState is ReviewContentState.Error)
+        assertEquals(listOf("2026-08-01"), api.reviewQueueDates)
+    }
+
+    @Test
+    fun reviewQueueSupportsDataEmptyAndIndependentRetry() = runTest(dispatcher) {
+        val api = FakeTaskApi()
+        val model = MainViewModel(api = api, currentDate = { "2026-08-02" })
+
+        model.refreshReviewQueue()
+        advanceUntilIdle()
+        val data = model.state.value.reviewQueueState as ReviewContentState.Data
+        assertEquals("daily-1", data.value.items.single().contentUuid)
+
+        api.emptyReviewQueue = true
+        model.refreshReviewQueue()
+        advanceUntilIdle()
+        assertTrue(model.state.value.reviewQueueState is ReviewContentState.Empty)
+        assertEquals(2, api.reviewQueueDates.size)
+    }
+
+    @Test
+    fun lessonReviewIsRequestedOnlyAfterCompletedProgressIsRestored() = runTest(dispatcher) {
+        val incompleteApi = FakeTaskApi()
+        val incomplete = MainViewModel(incompleteApi)
+        incomplete.refreshDaily()
+        advanceUntilIdle()
+        assertTrue(incompleteApi.reportRequests.isEmpty())
+        assertTrue(incomplete.state.value.lessonReviewState is ReviewContentState.Empty)
+
+        val completedApi = FakeTaskApi().apply { remoteProgressCompleted = true }
+        val completed = MainViewModel(completedApi)
+        completed.refreshDaily()
+        advanceUntilIdle()
+
+        assertEquals(listOf("daily-1"), completedApi.reportRequests)
+        assertTrue(completed.state.value.lessonReviewState is ReviewContentState.Data)
+    }
+
+    @Test
+    fun lessonReviewFailureRemainsLocalAndCanBeRetried() = runTest(dispatcher) {
+        val api = FakeTaskApi().apply {
+            remoteProgressCompleted = true
+            failLessonReview = true
+        }
+        val model = MainViewModel(api)
+
+        model.refreshDaily()
+        advanceUntilIdle()
+
+        assertEquals("daily-1", model.state.value.dailyPlan?.contentUuid)
+        assertNull(model.state.value.error)
+        assertTrue(model.state.value.lessonReviewState is ReviewContentState.Error)
+
+        api.failLessonReview = false
+        model.refreshLessonReview()
+        assertTrue(model.state.value.lessonReviewState is ReviewContentState.Loading)
+        advanceUntilIdle()
+        assertTrue(model.state.value.lessonReviewState is ReviewContentState.Data)
+        assertEquals(2, api.reportRequests.size)
+    }
+
+    @Test
+    fun successfulCompletedSyncLoadsLessonReview() = runTest(dispatcher) {
+        val api = FakeTaskApi().apply { missingLearningProgress = true }
+        val model = MainViewModel(api)
+        model.refreshDaily()
+        advanceUntilIdle()
+        assertTrue(model.openTodayLesson())
+        advanceUntilIdle()
+
+        model.markVocabularyDone()
+        model.markReadingDone()
+        model.recordQuizResult(4, 5)
+        model.onPlaybackProgress(90_000, 100_000)
+        val recording = File.createTempFile("review-answer", ".m4a").apply {
+            writeBytes(ByteArray(1024))
+            deleteOnExit()
+        }
+        model.submitAnswer(recording)
+        advanceUntilIdle()
+
+        assertTrue(model.state.value.currentProgress?.completed == true)
+        assertEquals(listOf("daily-1"), api.reportRequests)
+        assertTrue(model.state.value.lessonReviewState is ReviewContentState.Data)
+    }
+
+    @Test
+    fun reviewQueueItemOpensAvailableLessonAndMissingLessonFailsSafely() = runTest(dispatcher) {
+        val model = MainViewModel(FakeTaskApi())
+        model.refreshDaily()
+        advanceUntilIdle()
+        val item = (model.state.value.reviewQueueState as ReviewContentState.Data)
+            .value.items.single()
+
+        assertTrue(model.openReviewQueueItem(item))
+        assertEquals("daily-1", model.state.value.task?.taskUuid)
+        assertEquals(LearningStep.LISTEN, model.state.value.step)
+
+        assertFalse(
+            model.openReviewQueueItem(
+                ReviewQueueItem(id = "missing", contentUuid = "not-local"),
+            )
+        )
+        assertNotNull(model.state.value.reviewQueueMessage)
+        assertEquals("daily-1", model.state.value.task?.taskUuid)
+    }
+
     private class FakeTaskApi : TaskApi {
         var created: CreateTaskRequest? = null
         var createdLong: CreateLongLessonRequest? = null
@@ -270,7 +398,13 @@ class MainViewModelTest {
         var contentPollCount = 0
         var failLearningApi = false
         var missingLearningProgress = false
+        var failReviewQueue = false
+        var emptyReviewQueue = false
+        var remoteProgressCompleted = false
+        var failLessonReview = false
         val savedProgress = mutableListOf<LearningProgressRequest>()
+        val reviewQueueDates = mutableListOf<String>()
+        val reportRequests = mutableListOf<String>()
 
         override suspend fun create(request: CreateTaskRequest): TaskResponse {
             created = request
@@ -306,6 +440,7 @@ class MainViewModelTest {
         override suspend fun library(): List<ContentResponse> = listOf(
             dailyContent(),
             longContent(),
+            failedContent(),
         )
 
         override suspend fun createLongLesson(
@@ -354,6 +489,13 @@ class MainViewModelTest {
                 contentUuid = contentUuid,
                 positionMs = 42_000,
                 durationMs = 100_000,
+                vocabularyDone = remoteProgressCompleted,
+                listeningDone = remoteProgressCompleted,
+                readingDone = remoteProgressCompleted,
+                quizCorrect = if (remoteProgressCompleted) 4 else 0,
+                quizTotal = if (remoteProgressCompleted) 5 else 0,
+                speakingScore = if (remoteProgressCompleted) 86 else null,
+                completed = remoteProgressCompleted,
             )
         }
 
@@ -388,6 +530,51 @@ class MainViewModelTest {
             status: String?,
         ): List<VocabularyProgressResponse> = emptyList()
 
+        override suspend fun lessonReviewReport(
+            clientId: String,
+            contentUuid: String,
+        ): LessonReviewReportResponse {
+            reportRequests += contentUuid
+            if (failLessonReview) error("review report unavailable")
+            return LessonReviewReportResponse(
+                clientId = clientId,
+                contentUuid = contentUuid,
+                overallScore = 88,
+                dimensions = listOf(
+                    ReviewDimension("listening", "Listening", 88, "STRONG"),
+                ),
+                nextActions = listOf("Continue learning"),
+                generatedAt = "2026-08-01T08:00:00Z",
+            )
+        }
+
+        override suspend fun reviewQueue(
+            clientId: String,
+            date: String,
+            limit: Int,
+        ): ReviewQueueResponse {
+            reviewQueueDates += date
+            if (failReviewQueue) error("review service unavailable")
+            val items = if (emptyReviewQueue) emptyList() else listOf(
+                ReviewQueueItem(
+                    id = "review-1",
+                    type = "VOCABULARY",
+                    contentUuid = "daily-1",
+                    title = "Review virtual threads",
+                    priority = 1,
+                )
+            )
+            return ReviewQueueResponse(
+                clientId = clientId,
+                date = date,
+                totalCount = items.size,
+                estimatedMinutes = items.size,
+                items = items,
+            )
+        }
+
+        override suspend fun latestAppRelease(): AppReleaseResponse = error("not used")
+
         private fun dailyContent() = ContentResponse(
             uuid = "daily-1",
             title = "Virtual threads in practice",
@@ -406,6 +593,16 @@ class MainViewModelTest {
             sourceText = "",
             level = "B1",
             status = "GENERATING",
+        )
+
+        private fun failedContent() = ContentResponse(
+            uuid = "failed-1",
+            title = "Broken cloud lesson",
+            sourceType = "NEWS",
+            sourceText = "",
+            level = "B1",
+            status = "FAILED",
+            failureReason = "SCRIPT_GENERATION: malformed JSON",
         )
 
         private fun topicContent() = ContentResponse(

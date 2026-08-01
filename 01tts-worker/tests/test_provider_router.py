@@ -30,6 +30,25 @@ class ProviderRouterTest(unittest.TestCase):
             max_retries=1,
         )
 
+    def test_deepseek_gets_second_json_attempt_before_fallback(self):
+        deepseek = Mock()
+        deepseek.api_key = "deepseek-key"
+        deepseek.model = "deepseek-chat"
+        deepseek.generate_lesson.return_value = {"title": "Recovered JSON"}
+        router = ProviderRouter([("deepseek", deepseek)])
+
+        result = router.generate_lesson(
+            "prompt",
+            metadata={"uuid": "lesson-1"},
+        )
+
+        self.assertEqual("Recovered JSON", result["title"])
+        deepseek.generate_lesson.assert_called_once_with(
+            "prompt",
+            metadata={"uuid": "lesson-1"},
+            max_retries=2,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

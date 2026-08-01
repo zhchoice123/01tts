@@ -25,13 +25,13 @@ android {
         applicationId = "com.example.ttsapp"
         minSdk = 26
         targetSdk = 36
-        versionCode = 4
-        versionName = "2.3.0"
+        versionCode = 11
+        versionName = "2.7.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField(
             "String",
             "API_BASE_URL",
-            "\"${providers.gradleProperty("LISTENING_LAB_API_URL").getOrElse("https://api.zhchoice.xyz/")}\"",
+            "\"${providers.gradleProperty("LISTENING_LAB_API_URL").getOrElse("http://42.192.62.145:8080/")}\"",
         )
         buildConfigField("String", "DEEPSEEK_API_KEY", quotedBuildConfigValue("DEEPSEEK_API_KEY"))
         buildConfigField("String", "MOONSHOT_API_KEY", quotedBuildConfigValue("MOONSHOT_API_KEY"))
@@ -59,6 +59,7 @@ dependencies {
     implementation(composeBom)
     androidTestImplementation(composeBom)
     implementation("androidx.activity:activity-compose:1.12.4")
+    implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui")
@@ -68,6 +69,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.10.0")
     implementation("androidx.work:work-runtime-ktx:2.11.1")
     implementation("androidx.media3:media3-exoplayer:1.9.3")
+    implementation("androidx.media3:media3-datasource-okhttp:1.9.3")
     implementation("androidx.media3:media3-ui:1.9.3")
     implementation("com.squareup.retrofit2:retrofit:3.0.0")
     implementation("com.squareup.retrofit2:converter-gson:3.0.0")

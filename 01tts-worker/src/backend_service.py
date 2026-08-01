@@ -7,7 +7,7 @@ import shutil
 import tempfile
 import threading
 import uuid as uuid_module
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -33,7 +33,9 @@ from src.backend_models import (
 )
 from src.content_ingestion import fetch_content, fetch_feed_candidates
 from src.deepseek_service import DeepSeekService, count_english_words
+from src.lesson_review import generate_lesson_review_report
 from src.provider_router import ProviderRouter
+from src.review_queue import build_review_queue
 from src.schema_validator import validate_and_repair_lesson_content
 from src.speaking_service import SpeakingAssessmentService
 from src.tts_service import generate_audio, generate_dialogue_audio
@@ -130,6 +132,7 @@ class BackendService:
             self.task_audio_dir,
             self.content_audio_dir,
             self.answer_audio_dir,
+            self.app_release_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
         self.recover_incomplete_jobs()
@@ -190,6 +193,10 @@ class BackendService:
     @property
     def answer_audio_dir(self) -> Path:
         return self.config.storage_dir / "answers"
+
+    @property
+    def app_release_dir(self) -> Path:
+        return self.config.storage_dir / "app-releases"
 
     def start_consumers(self) -> None:
         if self.threads:
@@ -422,6 +429,43 @@ class BackendService:
             )
             return self.learning_progress_dict(progress) if progress else None
 
+    def lesson_review_report(
+        self,
+        client_id: str,
+        content_uuid: str,
+    ) -> dict[str, Any] | None:
+        with self.session_factory() as session:
+            progress = session.scalar(
+                select(LearningProgressRecord).where(
+                    LearningProgressRecord.client_id == client_id,
+                    LearningProgressRecord.content_uuid == content_uuid,
+                )
+            )
+            if progress is None:
+                return None
+            vocabulary = session.scalars(
+                select(VocabularyProgressRecord)
+                .where(
+                    VocabularyProgressRecord.client_id == client_id,
+                    VocabularyProgressRecord.content_uuid == content_uuid,
+                )
+                .order_by(
+                    VocabularyProgressRecord.updated_at.desc(),
+                    VocabularyProgressRecord.id.desc(),
+                )
+            ).all()
+
+            progress_payload = self.learning_progress_dict(progress)
+            vocabulary_payload = [
+                self.vocabulary_progress_dict(item) for item in vocabulary
+            ]
+        # SpeakingAnswerRecord has no client_id, so joining it by content UUID
+        # could expose another learner's evaluation. Use the scoped progress score.
+        return generate_lesson_review_report(
+            learning_progress=progress_payload,
+            vocabulary_progress=vocabulary_payload,
+        )
+
     def upsert_vocabulary_progress(
         self,
         *,
@@ -468,6 +512,36 @@ class BackendService:
                 query.order_by(VocabularyProgressRecord.updated_at.desc())
             ).all()
             return [self.vocabulary_progress_dict(item) for item in vocabulary]
+
+    def learning_review_queue(
+        self,
+        client_id: str,
+        review_date: date,
+        limit: int,
+    ) -> dict[str, Any]:
+        with self.session_factory() as session:
+            vocabulary = session.scalars(
+                select(VocabularyProgressRecord)
+                .where(VocabularyProgressRecord.client_id == client_id)
+                .order_by(
+                    VocabularyProgressRecord.updated_at.desc(),
+                    VocabularyProgressRecord.id.desc(),
+                )
+            ).all()
+            vocabulary_payload = [
+                self.vocabulary_progress_dict(item) for item in vocabulary
+            ]
+        as_of = datetime.combine(
+            review_date,
+            time(23, 59, 59),
+            tzinfo=timezone.utc,
+        )
+        return build_review_queue(
+            client_id=client_id,
+            as_of=as_of,
+            vocabulary_progress=vocabulary_payload,
+            limit=limit,
+        )
 
     def learning_dashboard(
         self,
@@ -641,7 +715,7 @@ class BackendService:
         if normalized_level not in {"B1", "B2"}:
             raise ValueError("level must be B1 or B2")
         envelope = {
-            "profile": "BACKEND_DAILY_DIALOGUE_10MIN",
+            "profile": "BACKEND_DAILY_DIALOGUE_5_8MIN",
             "format": "DIALOGUE",
             "topic": topic.strip(),
             "category": (category or "BACKEND").strip().upper(),
@@ -695,7 +769,9 @@ class BackendService:
     def library(self) -> list[dict[str, Any]]:
         with self.session_factory() as session:
             records = session.scalars(
-                select(ContentRecord).order_by(ContentRecord.created_at.desc())
+                select(ContentRecord)
+                .where(ContentRecord.status != "FAILED")
+                .order_by(ContentRecord.created_at.desc())
             ).all()
             return [self.content_dict(record) for record in records]
 
@@ -725,7 +801,12 @@ class BackendService:
             plan = session.get(DailyPlanRecord, plan_date)
             if plan:
                 content = session.get(ContentRecord, plan.content_uuid)
-                return self.daily_dict(plan, content)
+                if content and content.status != "FAILED":
+                    return self.daily_dict(plan, content)
+                # Keep the failed content row for diagnostics, but replace its visible
+                # daily-plan reference so the app never gets stuck on a failed lesson.
+                session.delete(plan)
+                session.commit()
 
         category, title, prompt = DAILY_TOPICS[plan_date.toordinal() % len(DAILY_TOPICS)]
         content = self.create_dialogue_lesson(
@@ -748,7 +829,10 @@ class BackendService:
             plan = session.get(DailyPlanRecord, plan_date)
             if not plan:
                 return None
-            return self.daily_dict(plan, session.get(ContentRecord, plan.content_uuid))
+            content = session.get(ContentRecord, plan.content_uuid)
+            if not content or content.status == "FAILED":
+                return None
+            return self.daily_dict(plan, content)
 
     def today(self) -> dict[str, Any]:
         today = self.local_today()
@@ -932,7 +1016,10 @@ class BackendService:
         with self.session_factory() as session:
             candidates = session.scalars(
                 select(TopicCandidateRecord)
-                .where(TopicCandidateRecord.plan_date == plan_date)
+                .where(
+                    TopicCandidateRecord.plan_date == plan_date,
+                    TopicCandidateRecord.status != "FAILED",
+                )
                 .order_by(
                     TopicCandidateRecord.score.desc(),
                     TopicCandidateRecord.created_at.asc(),
@@ -946,9 +1033,11 @@ class BackendService:
     def topic_lesson(self, topic_uuid: str) -> dict[str, Any] | None:
         with self.session_factory() as session:
             topic = session.get(TopicCandidateRecord, topic_uuid)
-            if not topic:
+            if not topic or topic.status == "FAILED":
                 return None
             content = session.get(ContentRecord, topic.content_uuid)
+            if not content or content.status == "FAILED":
+                return None
             return {
                 "topic": self.topic_dict(topic, content),
                 "content": self.content_dict(content),
@@ -956,7 +1045,9 @@ class BackendService:
 
     def create_answer(self, task_uuid: str, source_file: Path) -> dict[str, Any] | None:
         with self.session_factory() as session:
-            if not session.get(TaskRecord, task_uuid):
+            task = session.get(TaskRecord, task_uuid)
+            content = session.get(ContentRecord, task_uuid)
+            if not task and not content:
                 return None
         answer_uuid = str(uuid_module.uuid4())
         destination = self.answer_audio_dir / f"{answer_uuid}.m4a"
@@ -1019,6 +1110,7 @@ class BackendService:
             )
             is_ai_original_topic = topic is not None and topic.kind == "AI_ORIGINAL"
 
+        failure_stage = "SOURCE_INGESTION"
         try:
             if long_metadata:
                 ingested = self._resolve_long_lesson_source(
@@ -1042,7 +1134,7 @@ class BackendService:
                     else "backend technical English lesson"
                 )
                 prompt = (
-                    f"Create today's ten-minute {lesson_kind}. "
+                    f"Create today's {'5-8 minute' if long_metadata.get('format') == 'DIALOGUE' else 'ten-minute'} {lesson_kind}. "
                     f"Level: {difficulty}. Category: {long_metadata.get('category', 'BACKEND')}. "
                     f"Requested topic: {long_metadata.get('topic') or 'choose a practical backend topic'}. "
                     f"{title_instruction} SourceType: {ingested.source_type}. "
@@ -1062,6 +1154,7 @@ class BackendService:
                 "level": difficulty,
                 "passage": ingested.passage,
             }
+            failure_stage = "SCRIPT_GENERATION"
             if long_metadata:
                 is_dialogue = long_metadata.get("format") == "DIALOGUE"
                 generator_method = (
@@ -1078,15 +1171,16 @@ class BackendService:
                     metadata=metadata,
                 )
                 word_count = count_english_words(str(lesson.get("passage", "")))
-                minimum_words = 1250 if is_dialogue else 1200
-                if not minimum_words <= word_count <= 1500:
+                minimum_words = 700 if is_dialogue else 1200
+                maximum_words = 1050 if is_dialogue else 1500
+                if not minimum_words <= word_count <= maximum_words:
                     raise ValueError(
                         "Long lesson passage must contain "
-                        f"{minimum_words}-1500 English words; got {word_count}"
+                        f"{minimum_words}-{maximum_words} English words; got {word_count}"
                     )
                 lesson["wordCount"] = word_count
                 lesson["estimatedDurationSeconds"] = round(
-                    word_count / (125 if is_dialogue else 130) * 60
+                    word_count / 130 * 60
                 )
                 lesson["sourceAttribution"] = {
                     "title": ingested.title,
@@ -1107,6 +1201,7 @@ class BackendService:
             destination = (
                 self.task_audio_dir if task else self.content_audio_dir
             ) / f"{record_uuid}.mp3"
+            failure_stage = "AUDIO_SYNTHESIS"
             if long_metadata and long_metadata.get("format") == "DIALOGUE":
                 asyncio.run(
                     self.dialogue_audio_generator(
@@ -1120,16 +1215,24 @@ class BackendService:
                             long_metadata.get("expertVoice")
                             or "en-US-AndrewNeural"
                         ),
+                        api_key=self.config.worker.openai_api_key,
                     )
                 )
+                lesson["timingVersion"] = 1
             else:
+                word_timings: list[dict[str, Any]] = []
                 asyncio.run(
                     self.audio_generator(
                         text=passage,
                         output_path=destination,
                         voice=voice,
+                        word_timings=word_timings,
+                        api_key=self.config.worker.openai_api_key,
                     )
                 )
+                lesson["timingVersion"] = 1
+                lesson["wordTimings"] = word_timings
+            failure_stage = "PERSISTENCE"
             with self.session_factory() as session:
                 if task:
                     record = session.get(TaskRecord, record_uuid)
@@ -1157,14 +1260,15 @@ class BackendService:
             LOGGER.info("Completed lesson %s", record_uuid)
         except Exception as error:
             LOGGER.exception("Lesson %s failed", record_uuid)
+            failure_reason = f"{failure_stage}: {error}"[:4000]
             with self.session_factory() as session:
                 record = session.get(TaskRecord if task else ContentRecord, record_uuid)
                 if record:
                     record.status = "FAILED"
-                    record.failure_reason = str(error)[:4000]
+                    record.failure_reason = failure_reason
                     session.commit()
             if content:
-                self._sync_topic_status(record_uuid, "FAILED", str(error))
+                self._sync_topic_status(record_uuid, "FAILED", failure_reason)
 
     def _resolve_long_lesson_source(
         self,
@@ -1304,13 +1408,18 @@ class BackendService:
             lesson_content["coveredTargetWords"] = covered
             lesson_content["missingTargetWords"] = []
             destination = self.content_audio_dir / f"{lesson_uuid}.mp3"
+            word_timings: list[dict[str, Any]] = []
             asyncio.run(
                 self.audio_generator(
                     text=lesson_content["passage"],
                     output_path=destination,
                     voice=voice,
+                    word_timings=word_timings,
+                    api_key=self.config.worker.openai_api_key,
                 )
             )
+            lesson_content["timingVersion"] = 1
+            lesson_content["wordTimings"] = word_timings
             with self.session_factory() as session:
                 record = session.get(AnkiReviewLessonRecord, lesson_uuid)
                 record.status = "READY"
@@ -1354,7 +1463,14 @@ class BackendService:
                 )
                 return
             task = session.get(TaskRecord, answer.task_uuid)
-            question = self.speaking_question(task.questions if task else None)
+            content = (
+                None
+                if task
+                else session.get(ContentRecord, answer.task_uuid)
+            )
+            question = self.speaking_question(
+                task.questions if task else content.lesson_content if content else None
+            )
             audio_path = self.answer_audio_dir / f"{answer_uuid}.m4a"
         try:
             assessment = self.assessor.assess(audio_path, question)
@@ -1364,6 +1480,10 @@ class BackendService:
                 answer.transcript = assessment["transcript"]
                 answer.score = int(assessment["score"])
                 answer.feedback = str(assessment["feedback"])
+                answer.evaluation_json = json.dumps(
+                    assessment.get("evaluation") or {},
+                    ensure_ascii=False,
+                )
                 answer.failure_reason = None
                 session.commit()
         except Exception as error:
@@ -1411,6 +1531,11 @@ class BackendService:
     @staticmethod
     def speaking_question(raw_questions: Any) -> str:
         questions = json.loads(raw_questions) if isinstance(raw_questions, str) else raw_questions
+        if isinstance(questions, dict):
+            prompts = questions.get("speakingPrompts") or []
+            if prompts and isinstance(prompts[0], str) and prompts[0].strip():
+                return prompts[0].strip()
+            questions = questions.get("questions") or []
         for question in questions or []:
             if not isinstance(question, dict):
                 continue
@@ -1469,7 +1594,9 @@ class BackendService:
                     "category": long_metadata.get("category"),
                     "voice": long_metadata.get("voice"),
                     "sourceMode": long_metadata.get("sourceMode"),
-                    "estimatedMinutes": 10,
+                    "estimatedMinutes": (
+                        7 if long_metadata.get("format") == "DIALOGUE" else 10
+                    ),
                     "format": long_metadata.get("format", "ARTICLE"),
                     "hostVoice": long_metadata.get("hostVoice"),
                     "expertVoice": long_metadata.get("expertVoice"),
@@ -1512,6 +1639,12 @@ class BackendService:
 
     @classmethod
     def answer_dict(cls, answer: SpeakingAnswerRecord) -> dict[str, Any]:
+        evaluation = None
+        if answer.evaluation_json:
+            try:
+                evaluation = json.loads(answer.evaluation_json)
+            except (TypeError, json.JSONDecodeError):
+                evaluation = None
         return {
             "answerUuid": answer.answer_uuid,
             "taskUuid": answer.task_uuid,
@@ -1520,17 +1653,24 @@ class BackendService:
             "transcript": answer.transcript,
             "score": answer.score,
             "feedback": answer.feedback,
+            "evaluation": evaluation,
+            "failureReason": answer.failure_reason,
         }
 
     @classmethod
     def daily_dict(
         cls, plan: DailyPlanRecord, content: ContentRecord
     ) -> dict[str, Any]:
+        long_metadata = cls._long_lesson_metadata(content.source_text) or {}
         return {
             "planDate": plan.plan_date.isoformat(),
             "contentUuid": plan.content_uuid,
             "createdAt": cls.iso(plan.created_at),
-            "estimatedMinutes": 10,
+            "estimatedMinutes": (
+                7
+                if long_metadata.get("format") == "DIALOGUE"
+                else 10
+            ),
             "content": cls.content_dict(content),
         }
 

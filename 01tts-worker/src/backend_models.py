@@ -137,6 +137,7 @@ class SpeakingAnswerRecord(Base):
     transcript: Mapped[str | None] = mapped_column(Text)
     score: Mapped[int | None] = mapped_column(Integer)
     feedback: Mapped[str | None] = mapped_column(Text)
+    evaluation_json: Mapped[str | None] = mapped_column(Text)
     failure_reason: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(

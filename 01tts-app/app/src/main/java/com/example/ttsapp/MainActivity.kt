@@ -1,16 +1,22 @@
 package com.example.ttsapp
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaRecorder
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -45,10 +51,12 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.ClickableText
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Home
@@ -60,6 +68,7 @@ import androidx.compose.material.icons.filled.School
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.SystemUpdateAlt
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -89,6 +98,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -98,11 +108,15 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.layout.ContentScale
@@ -112,11 +126,15 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import com.example.ttsapp.network.ApiClient
+import com.example.ttsapp.review.DailyReviewQueueSection
+import com.example.ttsapp.review.LessonReviewReportCard
+import com.example.ttsapp.review.ReviewQueueItem
 import com.example.ttsapp.core.notifications.DailyLearningScheduler
 import com.example.ttsapp.core.ai.ProviderKind
 import com.example.ttsapp.core.ai.ProviderRegistry
@@ -124,9 +142,11 @@ import java.io.File
 import java.util.Locale
 import kotlin.math.sqrt
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class RecordingState {
     IDLE,
@@ -181,6 +201,19 @@ class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    private var pendingUpdateApk: File? = null
+    private val installPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            pendingUpdateApk?.let { apk ->
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
+                    packageManager.canRequestPackageInstalls()
+                ) {
+                    launchPackageInstaller(apk)
+                    pendingUpdateApk = null
+                }
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         DailyLearningScheduler.schedule(applicationContext)
@@ -219,9 +252,41 @@ class MainActivity : ComponentActivity() {
                     recordingAmplitude = recordingAmplitude.floatValue,
                     onRecord = { toggleRecording(model::submitAnswer) },
                     onCancelRecording = ::cancelRecording,
+                    onInstallUpdate = ::requestUpdateInstallation,
                 )
             }
         }
+    }
+
+    private fun requestUpdateInstallation(apk: File) {
+        if (!apk.isFile) return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            !packageManager.canRequestPackageInstalls()
+        ) {
+            pendingUpdateApk = apk
+            installPermissionLauncher.launch(
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName"),
+                )
+            )
+            return
+        }
+        launchPackageInstaller(apk)
+    }
+
+    private fun launchPackageInstaller(apk: File) {
+        val uri = FileProvider.getUriForFile(
+            this,
+            "$packageName.fileprovider",
+            apk,
+        )
+        startActivity(
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        )
     }
 
     private fun toggleRecording(onRecorded: (File) -> Unit) {
@@ -315,16 +380,50 @@ private fun ListeningApp(
     recordingAmplitude: Float,
     onRecord: () -> Unit,
     onCancelRecording: () -> Unit,
+    onInstallUpdate: (File) -> Unit,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     var historyVisible by remember { mutableStateOf(false) }
     var themeSheetVisible by rememberSaveable { mutableStateOf(false) }
     var destination by rememberSaveable { mutableStateOf(AppDestination.TODAY) }
     var pendingTopicUuid by rememberSaveable { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
+    val updateManager = remember { AppUpdateManager(context.applicationContext) }
+    val updateScope = rememberCoroutineScope()
+    var updateState by remember { mutableStateOf<AppUpdateState>(AppUpdateState.Idle) }
+
+    fun checkForUpdate() {
+        updateScope.launch {
+            updateState = AppUpdateState.Checking
+            updateState = updateManager.checkForUpdate()
+        }
+    }
+
+    fun downloadUpdate(release: com.example.ttsapp.network.AppReleaseResponse) {
+        updateScope.launch {
+            updateState = AppUpdateState.Downloading(release, 0f)
+            val result = updateManager.download(release) { progress ->
+                withContext(Dispatchers.Main.immediate) {
+                    updateState = AppUpdateState.Downloading(release, progress)
+                }
+            }
+            updateState = result.fold(
+                onSuccess = { AppUpdateState.ReadyToInstall(release, it) },
+                onFailure = {
+                    AppUpdateState.Error(
+                        it.message?.let { message -> "Download failed: $message" }
+                            ?: "Download failed",
+                    )
+                },
+            )
+        }
+    }
 
     LaunchedEffect(Unit) {
         model.refreshDaily()
         model.refreshTopics()
+        updateState = AppUpdateState.Checking
+        updateState = updateManager.checkForUpdate()
     }
 
     LaunchedEffect(
@@ -464,6 +563,13 @@ private fun ListeningApp(
                     }
                 },
                 onRefresh = model::refreshDaily,
+                onReviewQueueRetry = model::refreshReviewQueue,
+                onLessonReviewRetry = model::refreshLessonReview,
+                onReviewQueueItem = { item ->
+                    if (model.openReviewQueueItem(item)) {
+                        destination = AppDestination.PRACTICE
+                    }
+                },
                 modifier = Modifier.padding(padding),
             )
             AppDestination.READ -> ReadingHub(
@@ -535,8 +641,12 @@ private fun ListeningApp(
             )
             AppDestination.SETTINGS -> SettingsHub(
                 state = state,
+                updateState = updateState,
                 onSelectTheme = model::setTheme,
                 onSelectLanguage = model::setLanguage,
+                onCheckForUpdate = ::checkForUpdate,
+                onDownloadUpdate = ::downloadUpdate,
+                onInstallUpdate = onInstallUpdate,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -549,6 +659,9 @@ private fun TodayHub(
     languageId: String,
     onStart: () -> Unit,
     onRefresh: () -> Unit,
+    onReviewQueueRetry: () -> Unit,
+    onLessonReviewRetry: () -> Unit,
+    onReviewQueueItem: (ReviewQueueItem) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val todayUuid = state.dailyPlan?.contentUuid
@@ -728,6 +841,31 @@ private fun TodayHub(
                         Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
+            }
+        }
+        item {
+            DailyReviewQueueSection(
+                state = state.reviewQueueState,
+                languageId = languageId,
+                onRetry = onReviewQueueRetry,
+                onItemClick = onReviewQueueItem,
+            )
+            state.reviewQueueMessage?.let { message ->
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    message,
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+        }
+        if (progress?.completed == true) {
+            item {
+                LessonReviewReportCard(
+                    state = state.lessonReviewState,
+                    languageId = languageId,
+                    onRetry = onLessonReviewRetry,
+                )
             }
         }
         item {
@@ -1152,8 +1290,12 @@ private fun LibraryHub(
 @Composable
 private fun SettingsHub(
     state: LearningUiState,
+    updateState: AppUpdateState,
     onSelectTheme: (String) -> Unit,
     onSelectLanguage: (String) -> Unit,
+    onCheckForUpdate: () -> Unit,
+    onDownloadUpdate: (com.example.ttsapp.network.AppReleaseResponse) -> Unit,
+    onInstallUpdate: (File) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val selectedThemeId = state.selectedThemeId
@@ -1173,7 +1315,7 @@ private fun SettingsHub(
     ) {
         item {
             Text(localized(selectedLanguageId, "Settings", "设置"), style = MaterialTheme.typography.headlineMedium)
-            Text(localized(selectedLanguageId, "Language, theme and AI provider configuration.", "配置界面语言、主题和 AI 服务。"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(localized(selectedLanguageId, "Language, theme, updates and AI provider configuration.", "配置界面语言、主题、应用更新和 AI 服务。"), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1250,6 +1392,131 @@ private fun SettingsHub(
                                     tint = MaterialTheme.colorScheme.primary,
                                 )
                             }
+                        }
+                    }
+                }
+            }
+        }
+        item {
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            Text(
+                localized(selectedLanguageId, "App updates", "应用更新"),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            Icons.Default.SystemUpdateAlt,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary,
+                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                localized(selectedLanguageId, "Listening Lab", "Listening Lab"),
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                localized(
+                                    selectedLanguageId,
+                                    "Installed ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                                    "当前版本 ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})",
+                                ),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                        }
+                    }
+                    when (val current = updateState) {
+                        AppUpdateState.Idle -> Unit
+                        AppUpdateState.Checking -> {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            Text(localized(selectedLanguageId, "Checking your server…", "正在检查云服务器…"))
+                        }
+                        AppUpdateState.UpToDate -> Text(
+                            localized(selectedLanguageId, "You already have the latest version.", "当前已经是最新版本。"),
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        is AppUpdateState.Available -> {
+                            Text(
+                                localized(
+                                    selectedLanguageId,
+                                    "Version ${current.release.versionName} is ready",
+                                    "发现新版本 ${current.release.versionName}",
+                                ),
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            current.release.changelog.forEach { note ->
+                                Text("• $note", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Button(
+                                onClick = { onDownloadUpdate(current.release) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(Icons.Default.Download, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text(localized(selectedLanguageId, "Download update", "下载更新"))
+                            }
+                        }
+                        is AppUpdateState.Downloading -> {
+                            LinearProgressIndicator(
+                                progress = { current.progress },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                            Text(
+                                localized(
+                                    selectedLanguageId,
+                                    "Downloading ${(current.progress * 100).toInt()}%",
+                                    "正在下载 ${(current.progress * 100).toInt()}%",
+                                )
+                            )
+                        }
+                        is AppUpdateState.ReadyToInstall -> {
+                            Text(
+                                localized(selectedLanguageId, "Download verified. Ready to install.", "下载与校验完成，可以安装。"),
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                            Button(
+                                onClick = { onInstallUpdate(current.apk) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(Icons.Default.SystemUpdateAlt, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text(localized(selectedLanguageId, "Install now", "立即安装"))
+                            }
+                        }
+                        is AppUpdateState.Error -> {
+                            Text(current.message, color = MaterialTheme.colorScheme.error)
+                            OutlinedButton(
+                                onClick = onCheckForUpdate,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(localized(selectedLanguageId, "Try again", "重新检查"))
+                            }
+                        }
+                    }
+                    if (updateState !is AppUpdateState.Checking &&
+                        updateState !is AppUpdateState.Downloading &&
+                        updateState !is AppUpdateState.Available &&
+                        updateState !is AppUpdateState.ReadyToInstall &&
+                        updateState !is AppUpdateState.Error
+                    ) {
+                        OutlinedButton(
+                            onClick = onCheckForUpdate,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(localized(selectedLanguageId, "Check for updates", "检查更新"))
                         }
                     }
                 }
@@ -1641,6 +1908,9 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
     val questions = remember(task.questions) { parseQuestions(task.questions) }
     val vocabulary = remember(task.vocabulary) { parseVocabulary(task.vocabulary) }
     val dialogue = remember(task.lessonContent) { parseDialogue(task.lessonContent) }
+    val lessonWords = remember(task.lessonContent, task.prompt) {
+        parseLessonWordTimings(task.lessonContent, task.prompt)
+    }
     val progress = state.currentProgress?.takeIf { it.contentUuid == task.taskUuid }
     var transcriptVisible by rememberSaveable(task.taskUuid) { mutableStateOf(false) }
     var playbackPosition by rememberSaveable(task.taskUuid) {
@@ -1650,6 +1920,12 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
     var seekSequence by remember(task.taskUuid) { mutableLongStateOf(0L) }
     val activeTurn = remember(dialogue, playbackPosition) {
         activeDialogueIndex(dialogue, playbackPosition)
+    }
+    val activeTurnWordIndex = remember(dialogue, activeTurn, playbackPosition) {
+        activeDialogueWordIndex(dialogue, activeTurn, playbackPosition)
+    }
+    val activeLessonWord = remember(lessonWords, playbackPosition) {
+        lessonWords.getOrNull(activeWordIndex(lessonWords, playbackPosition))
     }
     LaunchedEffect(progress?.positionMs) {
         val restored = progress?.positionMs ?: 0L
@@ -1710,8 +1986,10 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                     transcriptVisible = !transcriptVisible
                     if (transcriptVisible) model.markReadingDone()
                 },
-                onProgress = { positionMs, durationMs ->
+                onPositionChanged = { positionMs ->
                     playbackPosition = positionMs
+                },
+                onProgress = { positionMs, durationMs ->
                     model.onPlaybackProgress(positionMs, durationMs)
                 },
             )
@@ -1746,22 +2024,25 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                     style = MaterialTheme.typography.titleLarge,
                 )
                 if (dialogue.isEmpty()) {
-                    Text(
-                        task.prompt,
-                        style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    LessonTimedTranscript(
+                        text = task.prompt,
+                        words = lessonWords,
+                        activeWord = activeLessonWord,
+                        onSeek = { startMs ->
+                            seekSequence += 1
+                            seekRequest = PlaybackSeekRequest(seekSequence, startMs)
+                        },
                     )
                 } else {
                     dialogue.forEachIndexed { index, turn ->
                         DialogueTurnRow(
                             turn = turn,
                             active = index == activeTurn,
+                            activeWordIndex = if (index == activeTurn) activeTurnWordIndex else -1,
                             canSeek = turn.startMs != null,
-                            onClick = {
-                                turn.startMs?.let { startMs ->
-                                    seekSequence += 1
-                                    seekRequest = PlaybackSeekRequest(seekSequence, startMs)
-                                }
+                            onSeek = { startMs ->
+                                seekSequence += 1
+                                seekRequest = PlaybackSeekRequest(seekSequence, startMs)
                             },
                         )
                     }
@@ -1909,8 +2190,9 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
 private fun DialogueTurnRow(
     turn: DialogueTurn,
     active: Boolean,
+    activeWordIndex: Int,
     canSeek: Boolean,
-    onClick: () -> Unit,
+    onSeek: (Long) -> Unit,
 ) {
     val isHost = turn.speaker == "HOST"
     val roleColor = if (isHost) {
@@ -1918,17 +2200,23 @@ private fun DialogueTurnRow(
     } else {
         MaterialTheme.colorScheme.onSurfaceVariant
     }
-    val background = if (active) {
-        MaterialTheme.colorScheme.primaryContainer
-    } else {
-        Color.Transparent
-    }
+    val background by animateColorAsState(
+        targetValue = if (active) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            Color.Transparent
+        },
+        animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        label = "turnBackground",
+    )
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(12.dp))
             .background(background)
-            .clickable(enabled = canSeek, onClick = onClick)
+            .clickable(enabled = canSeek) {
+                turn.startMs?.let(onSeek)
+            }
             .padding(horizontal = 12.dp, vertical = 10.dp),
         horizontalArrangement = Arrangement.spacedBy(12.dp),
         verticalAlignment = Alignment.Top,
@@ -1947,7 +2235,12 @@ private fun DialogueTurnRow(
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.SemiBold,
             )
-            Text(turn.text, style = MaterialTheme.typography.bodyLarge)
+            TimedTranscriptText(
+                text = turn.text,
+                words = turn.words,
+                activeIndex = activeWordIndex,
+                onSeek = onSeek,
+            )
             if (canSeek) {
                 Text(
                     "Tap to play from ${formatDialogueTime(turn.startMs ?: 0)}",
@@ -1955,6 +2248,207 @@ private fun DialogueTurnRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        }
+    }
+}
+
+internal data class TranscriptBlock(
+    val text: String,
+    val words: List<WordTiming>,
+)
+
+internal fun splitTimedTranscript(
+    text: String,
+    words: List<WordTiming>,
+): List<TranscriptBlock> {
+    if (text.isBlank()) return emptyList()
+    val separators = Regex("""\n\s*\n""").findAll(text).toList()
+    val rawRanges = buildList {
+        var start = 0
+        separators.forEach { separator ->
+            add(start until separator.range.first)
+            start = separator.range.last + 1
+        }
+        add(start until text.length)
+    }
+    return rawRanges.mapNotNull { rawRange ->
+        var start = rawRange.first.coerceAtLeast(0)
+        var endExclusive = (rawRange.last + 1).coerceAtMost(text.length)
+        while (start < endExclusive && text[start].isWhitespace()) start++
+        while (endExclusive > start && text[endExclusive - 1].isWhitespace()) endExclusive--
+        if (start >= endExclusive) return@mapNotNull null
+        TranscriptBlock(
+            text = text.substring(start, endExclusive),
+            words = words.mapNotNull { word ->
+                if (word.charStart < start || word.charEnd > endExclusive) {
+                    null
+                } else {
+                    word.copy(
+                        charStart = word.charStart - start,
+                        charEnd = word.charEnd - start,
+                    )
+                }
+            },
+        )
+    }
+}
+
+@Composable
+private fun LessonTimedTranscript(
+    text: String,
+    words: List<WordTiming>,
+    activeWord: WordTiming?,
+    onSeek: (Long) -> Unit,
+) {
+    val blocks = remember(text, words) { splitTimedTranscript(text, words) }
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        blocks.forEach { block ->
+            val activeIndex = remember(block.words, activeWord) {
+                if (activeWord == null) {
+                    -1
+                } else {
+                    block.words.indexOfFirst { word ->
+                        word.startMs == activeWord.startMs &&
+                            word.endMs == activeWord.endMs &&
+                            word.text == activeWord.text
+                    }
+                }
+            }
+            val isBlockActive = activeIndex != -1
+            val blockBg by animateColorAsState(
+                targetValue = if (isBlockActive) {
+                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.12f)
+                } else {
+                    Color.Transparent
+                },
+                animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+                label = "blockBackground",
+            )
+            Surface(
+                color = blockBg,
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Box(modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)) {
+                    TimedTranscriptText(
+                        text = block.text,
+                        words = block.words,
+                        activeIndex = activeIndex,
+                        onSeek = onSeek,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TimedTranscriptText(
+    text: String,
+    words: List<WordTiming>,
+    activeIndex: Int,
+    onSeek: (Long) -> Unit,
+) {
+    var outgoingIndex by remember(words) { mutableIntStateOf(-1) }
+    var targetIndex by remember(words) { mutableIntStateOf(activeIndex) }
+    val highlightProgress = remember(words) { Animatable(1f) }
+    LaunchedEffect(activeIndex, words) {
+        if (activeIndex == targetIndex) return@LaunchedEffect
+        outgoingIndex = targetIndex
+        targetIndex = activeIndex
+        highlightProgress.snapTo(0f)
+        highlightProgress.animateTo(
+            targetValue = 1f,
+            animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
+        )
+        outgoingIndex = -1
+    }
+    val highlightColor = MaterialTheme.colorScheme.primaryContainer
+    val highlightedTextColor = MaterialTheme.colorScheme.onPrimaryContainer
+    val normalTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val progress = highlightProgress.value
+    val annotated = remember(
+        text,
+        words,
+        targetIndex,
+        outgoingIndex,
+        progress,
+        highlightColor,
+        highlightedTextColor,
+        normalTextColor,
+    ) {
+        buildTimedTranscript(
+            text = text,
+            words = words,
+            activeIndex = targetIndex,
+            previousActiveIndex = outgoingIndex,
+            transitionProgress = progress,
+            highlightColor = highlightColor,
+            highlightedTextColor = highlightedTextColor,
+            normalTextColor = normalTextColor,
+        )
+    }
+    ClickableText(
+        text = annotated,
+        style = MaterialTheme.typography.bodyLarge.copy(color = normalTextColor),
+        onClick = { offset ->
+            annotated.getStringAnnotations(
+                tag = WORD_TIMING_ANNOTATION,
+                start = offset,
+                end = offset,
+            ).firstOrNull()?.item?.toIntOrNull()?.let { index ->
+                words.getOrNull(index)?.let { onSeek(it.startMs) }
+            }
+        },
+    )
+}
+
+private const val WORD_TIMING_ANNOTATION = "word_timing"
+
+internal fun buildTimedTranscript(
+    text: String,
+    words: List<WordTiming>,
+    activeIndex: Int,
+    previousActiveIndex: Int = -1,
+    transitionProgress: Float = 1f,
+    highlightColor: Color,
+    highlightedTextColor: Color,
+    normalTextColor: Color = Color.Unspecified,
+): AnnotatedString = buildAnnotatedString {
+    append(text)
+    val incomingAlpha = transitionProgress.coerceIn(0f, 1f)
+    val outgoingAlpha = 1f - incomingAlpha
+    words.forEachIndexed { index, word ->
+        if (word.charStart < 0 || word.charEnd > text.length || word.charStart >= word.charEnd) {
+            return@forEachIndexed
+        }
+        addStringAnnotation(
+            tag = WORD_TIMING_ANNOTATION,
+            annotation = index.toString(),
+            start = word.charStart,
+            end = word.charEnd,
+        )
+        val highlightAlpha = when (index) {
+            activeIndex -> incomingAlpha
+            previousActiveIndex -> outgoingAlpha
+            else -> 0f
+        }
+        if (highlightAlpha > 0f) {
+            val textColor = if (normalTextColor == Color.Unspecified) {
+                highlightedTextColor
+            } else {
+                lerp(normalTextColor, highlightedTextColor, highlightAlpha)
+            }
+            addStyle(
+                style = SpanStyle(
+                    background = highlightColor.copy(
+                        alpha = highlightColor.alpha * highlightAlpha,
+                    ),
+                    color = textColor,
+                ),
+                start = word.charStart,
+                end = word.charEnd,
+            )
         }
     }
 }
@@ -2003,6 +2497,57 @@ private fun EvaluationMetricChip(label: String, scoreStr: String, modifier: Modi
                 fontWeight = FontWeight.Bold,
                 color = MaterialTheme.colorScheme.primary,
             )
+        }
+    }
+}
+
+@Composable
+private fun EvaluationMetricRow(
+    first: Pair<String, Int>,
+    second: Pair<String, Int>?,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        EvaluationMetricChip(first.first, first.second.toString(), Modifier.weight(1f))
+        if (second != null) {
+            EvaluationMetricChip(second.first, second.second.toString(), Modifier.weight(1f))
+        } else {
+            Spacer(Modifier.weight(1f))
+        }
+    }
+}
+
+@Composable
+private fun SpeakingFeedbackList(
+    title: String,
+    items: List<String>,
+    positive: Boolean = false,
+) {
+    val accent = if (positive) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.secondary
+    }
+    Surface(
+        color = accent.copy(alpha = 0.10f),
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, accent.copy(alpha = 0.35f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            items.forEachIndexed { index, item ->
+                Text(
+                    "${index + 1}. $item",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
         }
     }
 }
@@ -2141,10 +2686,8 @@ private fun SpeakingStep(
         )
 
         state.answer?.let { answer ->
-            val score = answer.score ?: 0
-            val pronScore = (score * 1.05).toInt().coerceAtMost(100)
-            val fluencyScore = (score * 0.95).toInt().coerceAtLeast(40)
-            val vocabScore = (score * 0.98).toInt().coerceAtLeast(50)
+            val evaluation = answer.evaluation
+            val score = evaluation?.overallScore ?: answer.score ?: 0
 
             Surface(
                 color = MaterialTheme.colorScheme.surfaceVariant,
@@ -2163,6 +2706,17 @@ private fun SpeakingStep(
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
+                            evaluation?.let {
+                                Text(
+                                    if (it.mode == "AUDIO_AND_TRANSCRIPT") {
+                                        "Direct audio + transcript · ${it.model}"
+                                    } else {
+                                        "Transcript fallback · ${it.model}"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
                         }
                         Surface(
                             color = MaterialTheme.colorScheme.primaryContainer,
@@ -2180,13 +2734,23 @@ private fun SpeakingStep(
 
                     HorizontalDivider(color = MaterialTheme.colorScheme.outline)
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    ) {
-                        EvaluationMetricChip("发音 (Pronunciation)", "$pronScore", Modifier.weight(1f))
-                        EvaluationMetricChip("流利 (Fluency)", "$fluencyScore", Modifier.weight(1f))
-                        EvaluationMetricChip("语法 (Grammar)", "$vocabScore", Modifier.weight(1f))
+                    if (evaluation?.mode == "AUDIO_AND_TRANSCRIPT") {
+                        EvaluationMetricRow(
+                            "发音 Pronunciation" to evaluation.pronunciationScore,
+                            "流利 Fluency" to evaluation.fluencyScore,
+                        )
+                        EvaluationMetricRow(
+                            "语调 Intonation" to evaluation.intonationScore,
+                            "节奏 Pacing" to evaluation.pacingScore,
+                        )
+                        EvaluationMetricRow(
+                            "切题 Relevance" to evaluation.relevanceScore,
+                            "语法 Grammar" to evaluation.grammarScore,
+                        )
+                        EvaluationMetricRow(
+                            "词汇 Vocabulary" to evaluation.vocabularyScore,
+                            null,
+                        )
                     }
 
                     answer.transcript?.let {
@@ -2205,7 +2769,8 @@ private fun SpeakingStep(
                         }
                     }
 
-                    answer.feedback?.let {
+                    val summary = evaluation?.summary?.ifBlank { null } ?: answer.feedback
+                    summary?.let {
                         Text("AI 教练纠错与指导 (Coach Feedback)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Surface(
                             color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
@@ -2220,6 +2785,26 @@ private fun SpeakingStep(
                                 modifier = Modifier.padding(12.dp),
                             )
                         }
+                    }
+
+                    evaluation?.strengths?.takeIf { it.isNotEmpty() }?.let {
+                        SpeakingFeedbackList(
+                            title = "做得好的地方 · Strengths",
+                            items = it,
+                            positive = true,
+                        )
+                    }
+                    evaluation?.improvements?.takeIf { it.isNotEmpty() }?.let {
+                        SpeakingFeedbackList(
+                            title = "需要提升 · Improvements",
+                            items = it,
+                        )
+                    }
+                    evaluation?.practicePlan?.takeIf { it.isNotEmpty() }?.let {
+                        SpeakingFeedbackList(
+                            title = "下一步练习 · Practice plan",
+                            items = it,
+                        )
                     }
                 }
             }

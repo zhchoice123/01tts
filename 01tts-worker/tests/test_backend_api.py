@@ -1,4 +1,5 @@
 import json
+import hashlib
 import tempfile
 import unittest
 import uuid
@@ -13,6 +14,7 @@ from api import create_app
 from src.backend_config import BackendConfig
 from src.backend_models import (
     LearningProgressRecord,
+    SpeakingAnswerRecord,
     VocabularyProgressRecord,
     create_session_factory,
 )
@@ -86,9 +88,9 @@ class FakeGenerator:
         lesson["dialogue"] = [
             {
                 "speaker": "HOST" if index % 2 == 0 else "EXPERT",
-                "text": " ".join(["backend"] * 63),
+                "text": " ".join(["backend"] * 50),
             }
-            for index in range(20)
+            for index in range(16)
         ]
         lesson["passage"] = "\n\n".join(
             f"{turn['speaker'].title()}: {turn['text']}"
@@ -104,12 +106,44 @@ class FakeAssessor:
             "transcript": "Virtual threads are lightweight.",
             "score": 91,
             "feedback": "Clear summary.",
+            "evaluation": {
+                "overallScore": 91,
+                "pronunciationScore": 92,
+                "fluencyScore": 90,
+                "intonationScore": 88,
+                "pacingScore": 91,
+                "relevanceScore": 94,
+                "grammarScore": 92,
+                "vocabularyScore": 90,
+                "summary": "Clear summary.",
+                "strengths": ["Clear pronunciation"],
+                "improvements": ["Use more varied intonation"],
+                "practicePlan": ["Shadow one paragraph"],
+                "mode": "AUDIO_AND_TRANSCRIPT",
+                "model": "gpt-audio-test",
+            },
         }
 
 
-async def fake_audio_generator(text, output_path, voice):
+async def fake_audio_generator(
+    text,
+    output_path,
+    voice,
+    word_timings=None,
+    api_key=None,
+):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b"ID3-fake-mp3")
+    if word_timings is not None:
+        word_timings.append(
+            {
+                "text": text.split()[0],
+                "startMs": 0,
+                "endMs": 300,
+                "charStart": 0,
+                "charEnd": len(text.split()[0]),
+            }
+        )
     return output_path
 
 
@@ -118,6 +152,7 @@ async def fake_dialogue_audio_generator(
     output_path,
     host_voice,
     expert_voice,
+    api_key=None,
 ):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b"ID3-fake-dialogue-mp3")
@@ -126,6 +161,7 @@ async def fake_dialogue_audio_generator(
         turn["startMs"] = position
         position += 3000
         turn["endMs"] = position
+        turn["words"] = []
     return output_path
 
 
@@ -229,6 +265,49 @@ class BackendApiTest(unittest.TestCase):
         self.assertEqual(200, audio.status_code)
         self.assertEqual(b"ID3-fake-mp3", audio.content)
 
+    def test_app_release_manifest_and_apk_download(self):
+        release_dir = self.service.app_release_dir
+        apk_name = "Listening-Lab-2.6.0.apk"
+        apk_bytes = b"fake-signed-apk"
+        (release_dir / apk_name).write_bytes(apk_bytes)
+        manifest = {
+            "versionCode": 7,
+            "versionName": "2.6.0",
+            "minimumVersionCode": 6,
+            "mandatory": False,
+            "title": "App online update",
+            "changelog": ["Download updates inside the app"],
+            "apkUrl": f"/api/v1/app/releases/{apk_name}",
+            "sha256": hashlib.sha256(apk_bytes).hexdigest(),
+            "sizeBytes": len(apk_bytes),
+            "publishedAt": "2026-08-01T10:00:00+08:00",
+        }
+        (release_dir / "latest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+
+        latest = self.client.get("/api/v1/app/releases/latest")
+        self.assertEqual(200, latest.status_code)
+        self.assertEqual(manifest, latest.json())
+        download = self.client.get(latest.json()["apkUrl"])
+        self.assertEqual(200, download.status_code)
+        self.assertEqual(apk_bytes, download.content)
+        self.assertEqual(
+            "application/vnd.android.package-archive",
+            download.headers["content-type"],
+        )
+
+    def test_app_release_rejects_invalid_or_missing_manifest(self):
+        release_dir = self.service.app_release_dir
+        missing = self.client.get("/api/v1/app/releases/latest")
+        self.assertEqual(404, missing.status_code)
+        (release_dir / "latest.json").write_text("{}", encoding="utf-8")
+        invalid = self.client.get("/api/v1/app/releases/latest")
+        self.assertEqual(503, invalid.status_code)
+        traversal = self.client.get("/api/v1/app/releases/not-an-apk.txt")
+        self.assertEqual(400, traversal.status_code)
+
     def test_daily_plan_library_and_attempt(self):
         generated = self.client.post("/api/v1/daily-plans/2026-07-26/generate")
         self.assertEqual(200, generated.status_code)
@@ -236,11 +315,11 @@ class BackendApiTest(unittest.TestCase):
         self.assertEqual("2026-07-26", plan["planDate"])
         self.assertEqual("GENERATING", plan["content"]["status"])
         self.assertEqual(
-            "BACKEND_DAILY_DIALOGUE_10MIN",
+            "BACKEND_DAILY_DIALOGUE_5_8MIN",
             plan["content"]["profile"],
         )
         self.assertEqual("DIALOGUE", plan["content"]["format"])
-        self.assertEqual(10, plan["estimatedMinutes"])
+        self.assertEqual(7, plan["estimatedMinutes"])
 
         library = self.client.get("/api/v1/library").json()
         self.assertEqual(1, len(library))
@@ -251,6 +330,29 @@ class BackendApiTest(unittest.TestCase):
         )
         self.assertEqual(200, attempt.status_code)
         self.assertEqual(1, attempt.json()["correctCount"])
+
+    def test_failed_content_is_hidden_and_failed_daily_plan_is_replaced(self):
+        first = self.client.post("/api/v1/daily-plans/2026-07-27/generate").json()
+        failed_uuid = first["contentUuid"]
+        failed = self.client.post(
+            f"/api/v1/content/{failed_uuid}/fail",
+            data={"reason": "SCRIPT_GENERATION: malformed JSON"},
+        )
+        self.assertEqual(200, failed.status_code)
+
+        self.assertEqual([], self.client.get("/api/v1/library").json())
+        self.assertEqual(
+            404,
+            self.client.get("/api/v1/daily-plans/2026-07-27").status_code,
+        )
+
+        replacement = self.client.post(
+            "/api/v1/daily-plans/2026-07-27/generate"
+        ).json()
+        self.assertNotEqual(failed_uuid, replacement["contentUuid"])
+        self.assertEqual("GENERATING", replacement["content"]["status"])
+        visible = self.client.get("/api/v1/library").json()
+        self.assertEqual([replacement["contentUuid"]], [item["uuid"] for item in visible])
 
     def test_long_lesson_is_accepted_asynchronously_and_becomes_ready(self):
         response = self.client.post(
@@ -280,6 +382,9 @@ class BackendApiTest(unittest.TestCase):
         self.assertEqual("en-US-AndrewNeural", completed["voice"])
         lesson = json.loads(completed["lessonContent"])
         self.assertEqual(1250, lesson["wordCount"])
+        self.assertEqual(1, lesson["timingVersion"])
+        self.assertEqual(1, len(lesson["wordTimings"]))
+        self.assertEqual(0, lesson["wordTimings"][0]["charStart"])
         self.assertTrue(completed["audioUrl"].endswith(".mp3"))
 
     def test_long_lesson_validates_request_options(self):
@@ -306,7 +411,7 @@ class BackendApiTest(unittest.TestCase):
         self.assertEqual("GENERATING", created["status"])
         self.assertEqual("DIALOGUE", created["format"])
         self.assertEqual(
-            "BACKEND_DAILY_DIALOGUE_10MIN",
+            "BACKEND_DAILY_DIALOGUE_5_8MIN",
             created["profile"],
         )
 
@@ -317,9 +422,11 @@ class BackendApiTest(unittest.TestCase):
         self.assertEqual("READY", completed["status"])
         lesson = json.loads(completed["lessonContent"])
         self.assertEqual("DIALOGUE", lesson["format"])
-        self.assertEqual(20, len(lesson["dialogue"]))
+        self.assertEqual(16, len(lesson["dialogue"]))
+        self.assertEqual(1, lesson["timingVersion"])
         self.assertEqual(0, lesson["dialogue"][0]["startMs"])
-        self.assertEqual(60_000, lesson["dialogue"][-1]["endMs"])
+        self.assertEqual(48_000, lesson["dialogue"][-1]["endMs"])
+        self.assertIn("words", lesson["dialogue"][0])
         self.assertEqual(
             b"ID3-fake-dialogue-mp3",
             self.client.get(completed["audioUrl"]).content,
@@ -394,6 +501,229 @@ class BackendApiTest(unittest.TestCase):
             422,
             self.client.get(
                 f"/api/v1/learning/progress/not-a-uuid/{uuid.uuid4()}"
+            ).status_code,
+        )
+
+    def test_lesson_review_report_uses_only_client_scoped_learning_data(self):
+        client_id = str(uuid.uuid4())
+        other_client_id = str(uuid.uuid4())
+        content_uuid = str(uuid.uuid4())
+        self.service.upsert_learning_progress(
+            client_id=client_id,
+            content_uuid=content_uuid,
+            position_ms=600_000,
+            duration_ms=600_000,
+            vocabulary_done=True,
+            listening_done=True,
+            reading_done=True,
+            quiz_correct=4,
+            quiz_total=5,
+            speaking_score=90,
+            completed=True,
+        )
+        for word, status in (("backpressure", "KNOWN"), ("latency", "NEW")):
+            self.service.upsert_vocabulary_progress(
+                client_id=client_id,
+                content_uuid=content_uuid,
+                word=word,
+                status=status,
+            )
+        self.service.upsert_vocabulary_progress(
+            client_id=other_client_id,
+            content_uuid=content_uuid,
+            word="private-foreign-word",
+            status="NEW",
+        )
+        with self.service.session_factory() as session:
+            session.add(
+                SpeakingAnswerRecord(
+                    answer_uuid=str(uuid.uuid4()),
+                    task_uuid=content_uuid,
+                    status="COMPLETED",
+                    audio_url="/audio/answers/report-test.m4a",
+                    score=42,
+                    evaluation_json=json.dumps(
+                        {
+                            "overallScore": 42,
+                            "improvements": ["Slow down before important terms."],
+                        }
+                    ),
+                )
+            )
+            session.commit()
+
+        response = self.client.get(
+            f"/api/v1/learning/reports/{client_id}/{content_uuid}"
+        )
+
+        self.assertEqual(200, response.status_code)
+        report = response.json()
+        self.assertEqual(client_id, report["clientId"])
+        self.assertEqual(content_uuid, report["contentUuid"])
+        dimensions = {item["key"]: item for item in report["dimensions"]}
+        self.assertEqual(100, dimensions["listening"]["score"])
+        self.assertEqual(80, dimensions["comprehension"]["score"])
+        self.assertEqual(50, dimensions["vocabulary"]["score"])
+        self.assertEqual(90, dimensions["speaking"]["score"])
+        self.assertEqual(80, report["overallScore"])
+        self.assertNotIn("private-foreign-word", json.dumps(report))
+        self.assertNotIn("Slow down before important terms.", json.dumps(report))
+        self.assertEqual(
+            404,
+            self.client.get(
+                f"/api/v1/learning/reports/{other_client_id}/{content_uuid}"
+            ).status_code,
+        )
+
+    def test_lesson_review_report_handles_missing_progress_and_speaking(self):
+        client_id = str(uuid.uuid4())
+        content_uuid = str(uuid.uuid4())
+        missing = self.client.get(
+            f"/api/v1/learning/reports/{client_id}/{content_uuid}"
+        )
+        self.assertEqual(404, missing.status_code)
+        self.assertEqual("learning progress not found", missing.json()["detail"])
+
+        self.service.upsert_learning_progress(
+            client_id=client_id,
+            content_uuid=content_uuid,
+            position_ms=0,
+            duration_ms=0,
+            vocabulary_done=False,
+            listening_done=False,
+            reading_done=False,
+            quiz_correct=0,
+            quiz_total=0,
+            speaking_score=None,
+            completed=False,
+        )
+        report = self.client.get(
+            f"/api/v1/learning/reports/{client_id}/{content_uuid}"
+        ).json()
+        speaking = next(
+            item for item in report["dimensions"] if item["key"] == "speaking"
+        )
+        self.assertIsNone(speaking["score"])
+        self.assertEqual("NO_DATA", speaking["status"])
+        invalid = self.client.get(
+            f"/api/v1/learning/reports/not-a-uuid/{content_uuid}"
+        )
+        self.assertEqual(422, invalid.status_code)
+
+    def test_learning_review_queue_empty_due_rules_and_client_isolation(self):
+        client_id = str(uuid.uuid4())
+        other_client_id = str(uuid.uuid4())
+        review_date = date(2026, 8, 1)
+        empty = self.client.get(
+            f"/api/v1/learning/review-queue/{client_id}?date={review_date}"
+        )
+        self.assertEqual(200, empty.status_code)
+        self.assertEqual([], empty.json()["items"])
+
+        rows = (
+            (
+                "new-word",
+                "NEW",
+                datetime(2026, 8, 1, 23, 59, 59, tzinfo=timezone.utc),
+            ),
+            (
+                "learning-word",
+                "LEARNING",
+                datetime(2026, 7, 31, 23, 59, 59, tzinfo=timezone.utc),
+            ),
+            (
+                "known-word",
+                "KNOWN",
+                datetime(2026, 7, 25, 23, 59, 59, tzinfo=timezone.utc),
+            ),
+            (
+                "not-due",
+                "LEARNING",
+                datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc),
+            ),
+        )
+        row_ids: dict[str, int] = {}
+        for word, status, _ in rows:
+            result = self.service.upsert_vocabulary_progress(
+                client_id=client_id,
+                content_uuid=str(uuid.uuid4()),
+                word=word,
+                status=status,
+            )
+            self.assertEqual(word, result["word"])
+        with self.service.session_factory() as session:
+            for record in session.scalars(
+                select(VocabularyProgressRecord).where(
+                    VocabularyProgressRecord.client_id == client_id
+                )
+            ):
+                row_ids[record.word] = record.id
+            for word, _, updated_at in rows:
+                session.get(VocabularyProgressRecord, row_ids[word]).updated_at = updated_at
+            session.commit()
+        self.service.upsert_vocabulary_progress(
+            client_id=other_client_id,
+            content_uuid=str(uuid.uuid4()),
+            word="foreign-word",
+            status="NEW",
+        )
+
+        response = self.client.get(
+            f"/api/v1/learning/review-queue/{client_id}?date={review_date}"
+        )
+
+        self.assertEqual(200, response.status_code)
+        queue = response.json()
+        self.assertEqual(client_id, queue["clientId"])
+        self.assertEqual("2026-08-01", queue["date"])
+        self.assertEqual(3, queue["totalCount"])
+        self.assertEqual(3, queue["estimatedMinutes"])
+        self.assertEqual(
+            {"new-word", "learning-word", "known-word"},
+            {item["word"] for item in queue["items"]},
+        )
+        self.assertNotIn("foreign-word", json.dumps(queue))
+        priorities = {item["word"]: item["priority"] for item in queue["items"]}
+        self.assertEqual(
+            {"new-word": 1, "learning-word": 2, "known-word": 3},
+            priorities,
+        )
+
+    def test_learning_review_queue_limit_and_query_validation(self):
+        client_id = str(uuid.uuid4())
+        review_date = date(2026, 8, 1)
+        for index in range(6):
+            self.service.upsert_vocabulary_progress(
+                client_id=client_id,
+                content_uuid=str(uuid.uuid4()),
+                word=f"word-{index}",
+                status="NEW",
+            )
+        response = self.client.get(
+            f"/api/v1/learning/review-queue/{client_id}"
+            f"?date={review_date}&limit=3"
+        )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(3, response.json()["totalCount"])
+        self.assertEqual(3, len(response.json()["items"]))
+
+        for query in (
+            "date=not-a-date",
+            "date=2026-08-01&limit=0",
+            "date=2026-08-01&limit=51",
+            "date=2026-08-01&limit=abc",
+            "",
+        ):
+            with self.subTest(query=query):
+                suffix = f"?{query}" if query else ""
+                invalid = self.client.get(
+                    f"/api/v1/learning/review-queue/{client_id}{suffix}"
+                )
+                self.assertEqual(422, invalid.status_code)
+        self.assertEqual(
+            422,
+            self.client.get(
+                "/api/v1/learning/review-queue/not-a-uuid?date=2026-08-01"
             ).status_code,
         )
 
@@ -549,6 +879,60 @@ class BackendApiTest(unittest.TestCase):
         answer = self.client.get(f"/api/v1/answers/{answer_uuid}").json()
         self.assertEqual("COMPLETED", answer["status"])
         self.assertEqual(91, answer["score"])
+        self.assertEqual(
+            92,
+            answer["evaluation"]["pronunciationScore"],
+        )
+
+    def test_speaking_answer_accepts_library_content_uuid(self):
+        content = self.client.post(
+            "/api/v1/content/import",
+            json={
+                "sourceType": "TEXT",
+                "text": "Explain why asynchronous processing improves responsiveness.",
+                "title": "Async Processing",
+                "level": "B1",
+            },
+        ).json()
+        completed = self.client.post(
+            f"/api/v1/content/{content['uuid']}/complete",
+            files={"audio": ("lesson.mp3", b"ID3-lesson", "audio/mpeg")},
+            data={
+                "lessonContent": json.dumps(
+                    {
+                        "passage": "Async processing keeps slow work off the UI thread.",
+                        "speakingPrompts": [
+                            "Explain one benefit of asynchronous processing."
+                        ],
+                    }
+                )
+            },
+        )
+        self.assertEqual(200, completed.status_code)
+
+        uploaded = self.client.post(
+            f"/api/v1/tasks/{content['uuid']}/answers",
+            files={"audio": ("answer.m4a", b"audio", "audio/mp4")},
+        )
+        self.assertEqual(200, uploaded.status_code)
+        answer_uuid = uploaded.json()["answerUuid"]
+
+        self.service.process_answer(answer_uuid)
+        answer = self.client.get(f"/api/v1/answers/{answer_uuid}").json()
+        self.assertEqual("COMPLETED", answer["status"])
+        self.assertEqual(91, answer["score"])
+
+    def test_speaking_question_reads_content_prompt(self):
+        lesson = json.dumps(
+            {
+                "questions": [],
+                "speakingPrompts": ["Describe the system in your own words."],
+            }
+        )
+        self.assertEqual(
+            "Describe the system in your own words.",
+            self.service.speaking_question(lesson),
+        )
 
     def test_health_and_not_found(self):
         self.assertEqual("UP", self.client.get("/health").json()["status"])

@@ -13,7 +13,13 @@ import com.example.ttsapp.network.TaskApi
 import com.example.ttsapp.network.TaskResponse
 import com.example.ttsapp.network.TopicRecommendationResponse
 import com.example.ttsapp.network.VocabularyProgressRequest
+import com.example.ttsapp.review.LessonReviewReportResponse
+import com.example.ttsapp.review.ReviewContentState
+import com.example.ttsapp.review.ReviewQueueItem
+import com.example.ttsapp.review.ReviewQueueResponse
+import com.example.ttsapp.review.asContentState
 import java.io.File
+import java.time.LocalDate
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -76,6 +82,10 @@ data class LearningUiState(
     val dashboardLoading: Boolean = false,
     val learningSyncMessage: String? = null,
     val vocabularyStatuses: Map<String, String> = emptyMap(),
+    val lessonReviewState: ReviewContentState<LessonReviewReportResponse> = ReviewContentState.Empty,
+    val lessonReviewContentUuid: String? = null,
+    val reviewQueueState: ReviewContentState<ReviewQueueResponse> = ReviewContentState.Empty,
+    val reviewQueueMessage: String? = null,
 )
 
 class MainViewModel(
@@ -85,6 +95,7 @@ class MainViewModel(
     private val languageStore: LanguagePreferenceStore = InMemoryLanguagePreferenceStore(),
     private val clientIdStore: ClientIdStore = InMemoryClientIdStore(),
     private val progressStore: LearningProgressStore = InMemoryLearningProgressStore(),
+    private val currentDate: () -> String = { LocalDate.now().toString() },
 ) : ViewModel() {
     private val clientId = clientIdStore.loadOrCreate()
     private var progressSaveJob: Job? = null
@@ -124,6 +135,7 @@ class MainViewModel(
 
     fun refreshDaily() {
         if (state.value.dailyLoading) return
+        refreshReviewQueue()
         viewModelScope.launch {
             mutableState.value = state.value.copy(dailyLoading = true, dailyError = null)
             runCatching { api.today() }
@@ -144,6 +156,72 @@ class MainViewModel(
             refreshLibrary()
             refreshDashboard()
         }
+    }
+
+    fun refreshReviewQueue() {
+        if (state.value.reviewQueueState is ReviewContentState.Loading) return
+        val date = currentDate()
+        mutableState.value = state.value.copy(
+            reviewQueueState = ReviewContentState.Loading,
+            reviewQueueMessage = null,
+        )
+        viewModelScope.launch {
+            runCatching { api.reviewQueue(clientId, date, 10) }
+                .onSuccess { queue ->
+                    mutableState.value = state.value.copy(
+                        reviewQueueState = queue.asContentState(),
+                        reviewQueueMessage = null,
+                    )
+                }
+                .onFailure { error ->
+                    mutableState.value = state.value.copy(
+                        reviewQueueState = ReviewContentState.Error(
+                            error.message ?: localizedReviewMessage(
+                                english = "Today's review queue could not be loaded.",
+                                chinese = "今日复习队列加载失败。",
+                            ),
+                        ),
+                    )
+                }
+        }
+    }
+
+    fun refreshLessonReview() {
+        val contentUuid = state.value.lessonReviewContentUuid
+            ?: state.value.task?.taskUuid
+            ?: state.value.dailyPlan?.contentUuid
+            ?: return
+        loadLessonReview(contentUuid, force = true)
+    }
+
+    fun openReviewQueueItem(item: ReviewQueueItem): Boolean {
+        val contentUuid = item.contentUuid.trim()
+        val dailyContent = state.value.dailyPlan?.content
+            ?.takeIf { it.uuid == contentUuid && it.status == "READY" }
+        val libraryContent = state.value.libraryContents
+            .firstOrNull { it.uuid == contentUuid && it.status == "READY" }
+        val historyEntry = state.value.history
+            .firstOrNull { it.task.taskUuid == contentUuid }
+        val opened = when {
+            dailyContent != null -> openContent(dailyContent)
+            libraryContent != null -> openContent(libraryContent)
+            historyEntry != null -> {
+                openLesson(historyEntry)
+                true
+            }
+            else -> false
+        }
+        mutableState.value = state.value.copy(
+            reviewQueueMessage = if (opened) {
+                null
+            } else {
+                localizedReviewMessage(
+                    english = "This review lesson is not available on this device yet.",
+                    chinese = "这项复习对应的课程暂未同步到本机。",
+                )
+            },
+        )
+        return opened
     }
 
     fun refreshDashboard() {
@@ -173,7 +251,8 @@ class MainViewModel(
             mutableState.value = state.value.copy(libraryLoading = true, libraryError = null)
             runCatching { api.library() }
                 .onSuccess { contents ->
-                    val readyEntries = contents
+                    val visibleContents = contents.filterNot { it.status == "FAILED" }
+                    val readyEntries = visibleContents
                         .filter { it.status == "READY" }
                         .map { LessonHistoryEntry(it.asTaskResponse()) }
                     val localByUuid = state.value.history.associateBy { it.task.taskUuid }
@@ -186,7 +265,7 @@ class MainViewModel(
                     ).distinctBy { it.task.taskUuid }.take(40)
                     historyStore.save(merged)
                     mutableState.value = state.value.copy(
-                        libraryContents = contents,
+                        libraryContents = visibleContents,
                         libraryLoading = false,
                         libraryError = null,
                         history = merged,
@@ -533,7 +612,8 @@ class MainViewModel(
                         answer = api.getAnswer(answer.answerUuid)
                     }
                     check(answer.status == "COMPLETED") {
-                        "Speaking evaluation finished with status ${answer.status}"
+                        answer.failureReason
+                            ?: "Speaking evaluation finished with status ${answer.status}"
                     }
                     answer
                 }
@@ -571,6 +651,7 @@ class MainViewModel(
         val local = progressFor(contentUuid)
         val isOpenLesson = state.value.task?.taskUuid == contentUuid
         val isTodayLesson = state.value.dailyPlan?.contentUuid == contentUuid
+        val isNewReviewTarget = state.value.lessonReviewContentUuid != contentUuid
         mutableState.value = state.value.copy(
             currentProgress = if (isOpenLesson || state.value.task == null) {
                 local
@@ -583,6 +664,12 @@ class MainViewModel(
                 state.value.todayProgress
             },
             learningSyncMessage = null,
+            lessonReviewState = if (isNewReviewTarget) {
+                ReviewContentState.Empty
+            } else {
+                state.value.lessonReviewState
+            },
+            lessonReviewContentUuid = contentUuid,
         )
         viewModelScope.launch {
             runCatching { api.learningProgress(clientId, contentUuid) }
@@ -615,6 +702,9 @@ class MainViewModel(
                             },
                             learningSyncMessage = null,
                         )
+                    }
+                    if (merged.completed) {
+                        loadLessonReview(contentUuid)
                     }
                 }
                 .onFailure { error ->
@@ -670,8 +760,27 @@ class MainViewModel(
             progress.copy(positionMs = progress.positionMs.coerceAtMost(progress.durationMs))
         }
         runCatching { api.saveLearningProgress(safeProgress) }
-            .onSuccess {
+            .onSuccess { saved ->
                 mutableState.value = state.value.copy(learningSyncMessage = null)
+                if (saved.completed) {
+                    val completedProgress = safeProgress.copy(completed = true)
+                    progressStore.save(completedProgress)
+                    val isOpenLesson = state.value.task?.taskUuid == saved.contentUuid
+                    val isTodayLesson = state.value.dailyPlan?.contentUuid == saved.contentUuid
+                    mutableState.value = state.value.copy(
+                        currentProgress = if (isOpenLesson) {
+                            completedProgress
+                        } else {
+                            state.value.currentProgress
+                        },
+                        todayProgress = if (isTodayLesson) {
+                            completedProgress
+                        } else {
+                            state.value.todayProgress
+                        },
+                    )
+                    loadLessonReview(saved.contentUuid)
+                }
             }
             .onFailure {
                 mutableState.value = state.value.copy(learningSyncMessage = offlineMessage())
@@ -679,9 +788,54 @@ class MainViewModel(
     }
 
     private fun LearningProgressRequest.withCompletion(): LearningProgressRequest = copy(
-        completed = vocabularyDone && listeningDone && readingDone &&
-            quizTotal > 0 && speakingScore != null,
+        completed = completed || (
+            vocabularyDone && listeningDone && readingDone &&
+                quizTotal > 0 && speakingScore != null
+            ),
     )
+
+    private fun loadLessonReview(contentUuid: String, force: Boolean = false) {
+        val progress = progressStore.load(contentUuid)
+            ?: state.value.currentProgress?.takeIf { it.contentUuid == contentUuid }
+            ?: state.value.todayProgress?.takeIf { it.contentUuid == contentUuid }
+        if (progress?.completed != true) return
+        if (!force && state.value.lessonReviewContentUuid == contentUuid) {
+            when (state.value.lessonReviewState) {
+                ReviewContentState.Loading,
+                is ReviewContentState.Data -> return
+                else -> Unit
+            }
+        }
+        mutableState.value = state.value.copy(
+            lessonReviewState = ReviewContentState.Loading,
+            lessonReviewContentUuid = contentUuid,
+        )
+        viewModelScope.launch {
+            runCatching { api.lessonReviewReport(clientId, contentUuid) }
+                .onSuccess { report ->
+                    if (state.value.lessonReviewContentUuid == contentUuid) {
+                        mutableState.value = state.value.copy(
+                            lessonReviewState = report.asContentState(),
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    if (state.value.lessonReviewContentUuid == contentUuid) {
+                        mutableState.value = state.value.copy(
+                            lessonReviewState = ReviewContentState.Error(
+                                error.message ?: localizedReviewMessage(
+                                    english = "The lesson review could not be loaded.",
+                                    chinese = "课程复盘加载失败。",
+                                ),
+                            ),
+                        )
+                    }
+                }
+        }
+    }
+
+    private fun localizedReviewMessage(english: String, chinese: String): String =
+        if (state.value.selectedLanguageId == AppLanguage.CHINESE.id) chinese else english
 
     private fun offlineMessage(): String =
         if (state.value.selectedLanguageId == AppLanguage.CHINESE.id) {
