@@ -25,8 +25,8 @@ android {
         applicationId = "com.example.ttsapp"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "2.7.1"
+        versionCode = 15
+        versionName = "2.8.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField(
             "String",

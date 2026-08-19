@@ -5,6 +5,7 @@ import unittest
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
@@ -21,6 +22,7 @@ from src.backend_models import (
 from src.backend_service import BackendService
 from src.config import WorkerConfig
 from src.content_ingestion import ContentMetadata
+from src.tts_service import _tts_provider_voice
 
 
 class FakeRedis:
@@ -30,15 +32,27 @@ class FakeRedis:
     def ping(self):
         return True
 
-    def lpush(self, queue: str, value: str):
-        self.queues.setdefault(queue, []).insert(0, value)
-        return len(self.queues[queue])
+    def lpush(self, name, *values):
+        self.queues.setdefault(name, []).extend(values)
+        return len(self.queues[name])
 
-    def brpop(self, queues, timeout=0):
+    def brpop(self, keys, timeout=0):
+        if isinstance(keys, str):
+            keys = [keys]
+        for key in keys:
+            items = self.queues.get(key, [])
+            if items:
+                return key, items.pop(0)
         return None
+
+    def close(self):
+        pass
 
 
 class FakeGenerator:
+    def generate_json(self, prompt, max_tokens=None, max_retries=None):
+        return self.generate_lesson(prompt)
+
     def generate_lesson(self, prompt, metadata=None):
         target_words = (metadata or {}).get("targetWords", [])
         passage = (
@@ -132,16 +146,19 @@ async def fake_audio_generator(
     word_timings=None,
     api_key=None,
 ):
+    _tts_provider_voice(voice)
+    output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(b"ID3-fake-mp3")
     if word_timings is not None:
+        first_word = text.split()[0] if text.split() else ""
         word_timings.append(
             {
-                "text": text.split()[0],
+                "text": first_word,
                 "startMs": 0,
                 "endMs": 300,
                 "charStart": 0,
-                "charEnd": len(text.split()[0]),
+                "charEnd": len(first_word),
             }
         )
     return output_path
@@ -691,7 +708,7 @@ class BackendApiTest(unittest.TestCase):
 
     def test_learning_review_queue_limit_and_query_validation(self):
         client_id = str(uuid.uuid4())
-        review_date = date(2026, 8, 1)
+        review_date = date.today()
         for index in range(6):
             self.service.upsert_vocabulary_progress(
                 client_id=client_id,
@@ -1190,6 +1207,214 @@ class BackendApiTest(unittest.TestCase):
         )
         self.assertEqual(200, completed_answer.status_code)
         self.assertEqual("COMPLETED", completed_answer.json()["status"])
+
+    def test_vocabulary_lookup_and_user_words_lifecycle(self):
+        client_id = str(uuid.uuid4())
+        content_uuid = str(uuid.uuid4())
+
+        # 1. Lookup vocabulary
+        lookup_resp = self.client.post(
+            "/api/v1/vocabulary/lookup",
+            json={
+                "word": "throughput",
+                "contextSentence": "Connection pools improve throughput under load.",
+            },
+        )
+        self.assertEqual(200, lookup_resp.status_code)
+        data = lookup_resp.json()
+        self.assertEqual("throughput", data["word"])
+        self.assertTrue("definitionCn" in data)
+
+        # 2. Save user vocabulary card
+        save_resp = self.client.post(
+            "/api/v1/vocabulary/user-words",
+            json={
+                "clientId": client_id,
+                "word": "throughput",
+                "definitionCn": "吞吐量；处理能力",
+                "definitionEn": "Amount of work completed per unit time.",
+                "phoneticUs": "/ˈθruːˌpʊt/",
+                "contextSentence": "Connection pools improve throughput under load.",
+                "contentUuid": content_uuid,
+                "sentenceStartMs": 14000,
+                "sentenceEndMs": 18500,
+            },
+        )
+        self.assertEqual(201, save_resp.status_code)
+        card = save_resp.json()
+        self.assertEqual("throughput", card["word"])
+        self.assertEqual("NEW", card["fsrsState"])
+
+        # 3. Query user vocabulary list
+        list_resp = self.client.get(f"/api/v1/vocabulary/user-words?clientId={client_id}&limit=10")
+        self.assertEqual(200, list_resp.status_code)
+        words_list = list_resp.json()
+        self.assertEqual(1, len(words_list))
+        self.assertEqual("throughput", words_list[0]["word"])
+
+    def test_speaking_session_lifecycle_with_audio_and_assessment(self):
+        client_id = str(uuid.uuid4())
+        content_uuid = str(uuid.uuid4())
+
+        # 1. Create session (verifies async audio synthesis & Path argument)
+        create_resp = self.client.post(
+            "/api/v1/speaking/sessions",
+            json={
+                "clientId": client_id,
+                "contentUuid": content_uuid,
+                "scenario": "SYSTEM_DESIGN_INTERVIEW",
+                "role": "TECH_LEAD",
+            },
+        )
+        self.assertEqual(201, create_resp.status_code)
+        session_data = create_resp.json()
+        session_id = session_data["sessionId"]
+        self.assertEqual(1, session_data["turnIndex"])
+        self.assertTrue(bool(session_data["aiAudioUrl"]))
+
+        # Verify AI audio URL is downloadable
+        audio_get = self.client.get(session_data["aiAudioUrl"])
+        self.assertEqual(200, audio_get.status_code)
+        self.assertEqual("audio/mpeg", audio_get.headers.get("content-type"))
+
+        # 2. Submit user turn with assessor configured
+        mock_assessor = Mock()
+        mock_assessor.transcribe.return_value = "I use message queues for decoupling."
+        mock_assessor.score.return_value = {"score": 92, "grammar_score": 94, "feedback": "Excellent response."}
+        self.service.assessor = mock_assessor
+
+        turn_resp = self.client.post(
+            f"/api/v1/speaking/sessions/{session_id}/turns",
+            data={"turnIndex": 1},
+            files={"audio": ("turn1.m4a", b"user_speech_bytes", "audio/mp4")},
+        )
+        self.assertEqual(200, turn_resp.status_code)
+        turn_data = turn_resp.json()
+        self.assertEqual("COMPLETED", turn_data["evaluationStatus"])
+        self.assertEqual("I use message queues for decoupling.", turn_data["userTranscript"])
+        self.assertEqual(92, turn_data["pronunciationScore"])
+        self.assertEqual(94, turn_data["grammarScore"])
+        self.assertEqual("Excellent response.", turn_data["quickFeedback"])
+        self.assertFalse(turn_data["isFinished"])
+        self.assertIsNotNone(turn_data["nextTurn"])
+        self.assertEqual(2, turn_data["nextTurn"]["turnIndex"])
+
+        # 3. Test assessor failure does NOT return fabricated scores
+        mock_assessor.score.side_effect = RuntimeError("scoring service down")
+        turn2_resp = self.client.post(
+            f"/api/v1/speaking/sessions/{session_id}/turns",
+            data={"turnIndex": 2},
+            files={"audio": ("turn2.m4a", b"user_speech_bytes_2", "audio/mp4")},
+        )
+        self.assertEqual(200, turn2_resp.status_code)
+        turn2_data = turn2_resp.json()
+        self.assertEqual("FAILED", turn2_data["evaluationStatus"])
+        self.assertIsNone(turn2_data["pronunciationScore"])
+        self.assertIsNone(turn2_data["grammarScore"])
+        self.assertIsNone(turn2_data["userTranscript"])
+        self.assertIsNone(turn2_data["quickFeedback"])
+
+        # 4. Out-of-order turn rejected
+        invalid_turn_resp = self.client.post(
+            f"/api/v1/speaking/sessions/{session_id}/turns",
+            data={"turnIndex": 5},
+            files={"audio": ("turn5.m4a", b"out_of_order", "audio/mp4")},
+        )
+        self.assertEqual(400, invalid_turn_resp.status_code)
+
+        # 5. Complete round 3
+        mock_assessor.score.side_effect = None
+        mock_assessor.score.return_value = {"score": 88, "grammar_score": 90, "feedback": "Good summary."}
+        turn3_resp = self.client.post(
+            f"/api/v1/speaking/sessions/{session_id}/turns",
+            data={"turnIndex": 3},
+            files={"audio": ("turn3.m4a", b"user_speech_bytes_3", "audio/mp4")},
+        )
+        self.assertEqual(200, turn3_resp.status_code)
+        turn3_data = turn3_resp.json()
+        self.assertTrue(turn3_data["isFinished"])
+
+        # 6. Submission on completed session rejected
+        after_comp_resp = self.client.post(
+            f"/api/v1/speaking/sessions/{session_id}/turns",
+            data={"turnIndex": 3},
+            files={"audio": ("turn3_again.m4a", b"extra", "audio/mp4")},
+        )
+        self.assertEqual(400, after_comp_resp.status_code)
+
+    def test_speaking_session_audio_endpoint_validation(self):
+        # Invalid file name
+        resp_bad = self.client.get("/api/v1/audio/speaking-sessions/not_a_valid_speaking_file.mp3")
+        self.assertEqual(400, resp_bad.status_code)
+
+        # Directory traversal
+        resp_traversal = self.client.get("/api/v1/audio/speaking-sessions/..%2Ftasks%2Fuuid.mp3")
+        self.assertIn(resp_traversal.status_code, (400, 404))
+
+        # Non-existent valid filename format
+        resp_404 = self.client.get("/api/v1/audio/speaking-sessions/spk_0123456789ab_turn1_ai.mp3")
+        self.assertEqual(404, resp_404.status_code)
+
+    def test_preview_tts_voice_validation(self):
+        # Valid voices
+        resp_openai = self.client.post(
+            "/api/v1/tts/demo",
+            json={"voice": "openai:nova", "text": "Testing voice validation."},
+        )
+        self.assertEqual(200, resp_openai.status_code)
+
+        resp_aliyun = self.client.post(
+            "/api/v1/tts/demo",
+            json={"voice": "aliyun:loongdavid_v2", "text": "Testing voice validation."},
+        )
+        self.assertEqual(200, resp_aliyun.status_code)
+
+        # Invalid provider
+        resp_inv_prov = self.client.post(
+            "/api/v1/tts/demo",
+            json={"voice": "invalid_prov:voice", "text": "Testing."},
+        )
+        self.assertEqual(400, resp_inv_prov.status_code)
+
+        # Invalid voice for provider
+        resp_inv_voice = self.client.post(
+            "/api/v1/tts/demo",
+            json={"voice": "openai:invalid_voice_name", "text": "Testing."},
+        )
+        self.assertEqual(400, resp_inv_voice.status_code)
+
+        resp_malformed_voice = self.client.post(
+            "/api/v1/tts/demo",
+            json={"voice": "openai:openai:nova", "text": "Testing."},
+        )
+        self.assertEqual(400, resp_malformed_voice.status_code)
+
+    def test_create_task_voice_validation(self):
+        resp_valid = self.client.post(
+            "/api/v1/tasks",
+            json={"prompt": "Test prompt", "voice": "en-US-AvaNeural"},
+        )
+        self.assertEqual(200, resp_valid.status_code)
+
+        resp_invalid = self.client.post(
+            "/api/v1/tasks",
+            json={"prompt": "Test prompt", "voice": "unknown_provider:voice"},
+        )
+        self.assertEqual(400, resp_invalid.status_code)
+
+    @patch("api.TASK_EVENTS_MAX_ITERATIONS", 1)
+    @patch("api.TASK_EVENTS_POLL_INTERVAL_SECONDS", 0)
+    def test_task_events_stream_endpoint(self):
+        task = self.client.post(
+            "/api/v1/tasks",
+            json={"prompt": "Explain Redis caching.", "voice": "en-US-AvaNeural"},
+        ).json()
+        with self.client.stream("GET", f"/api/v1/tasks/{task['taskUuid']}/events") as response:
+            self.assertEqual(200, response.status_code)
+            self.assertTrue("text/event-stream" in response.headers.get("content-type", ""))
+            first_chunk = next(response.iter_text())
+            self.assertTrue("event:" in first_chunk)
+            self.assertIn("event: timeout", first_chunk)
 
 
 if __name__ == "__main__":

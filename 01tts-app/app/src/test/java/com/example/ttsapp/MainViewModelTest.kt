@@ -11,8 +11,19 @@ import com.example.ttsapp.network.LearningProgressRequest
 import com.example.ttsapp.network.LearningProgressResponse
 import com.example.ttsapp.network.TaskApi
 import com.example.ttsapp.network.TaskResponse
+import com.example.ttsapp.network.TtsDemoRequest
+import com.example.ttsapp.network.TtsDemoResponse
 import com.example.ttsapp.network.TopicLessonResponse
 import com.example.ttsapp.network.TopicRecommendationResponse
+import com.example.ttsapp.network.CreateSpeakingSessionRequest
+import com.example.ttsapp.network.LookupVocabularyRequest
+import com.example.ttsapp.network.LookupVocabularyResponse
+import com.example.ttsapp.network.SaveUserVocabularyRequest
+import com.example.ttsapp.network.SpeakingSessionResponse
+import com.example.ttsapp.network.SpeakingSessionDetailResponse
+import com.example.ttsapp.network.SpeakingTurnDetail
+import com.example.ttsapp.network.SpeakingTurnResponse
+import com.example.ttsapp.network.UserVocabularyCardResponse
 import com.example.ttsapp.network.VocabularyProgressRequest
 import com.example.ttsapp.network.VocabularyProgressResponse
 import com.example.ttsapp.review.LessonReviewReportResponse
@@ -72,7 +83,7 @@ class MainViewModelTest {
         assertEquals(1, model.state.value.history.size)
         assertEquals(1, api.pollCount)
         assertEquals("hard", api.created?.difficulty)
-        assertEquals("en-US-AndrewNeural", api.created?.voice)
+        assertEquals("openai:en-US-AndrewNeural", api.created?.voice)
     }
 
     @Test
@@ -391,6 +402,86 @@ class MainViewModelTest {
         assertEquals("daily-1", model.state.value.task?.taskUuid)
     }
 
+    @Test
+    fun lookupAndSaveVocabularyFlow() = runTest(dispatcher) {
+        val api = FakeTaskApi()
+        val model = MainViewModel(api)
+
+        model.lookupWord("throughput", "Connection pools improve throughput.")
+        advanceUntilIdle()
+
+        assertEquals("throughput", model.state.value.selectedLookupWord?.word)
+        assertEquals("测试定义", model.state.value.selectedLookupWord?.definitionCn)
+
+        model.saveWordToBook("throughput", "测试定义")
+        advanceUntilIdle()
+
+        assertEquals(1, model.state.value.userWordbook.size)
+        assertEquals("concurrency", model.state.value.userWordbook[0].word)
+
+        model.dismissWordLookup()
+        assertNull(model.state.value.selectedLookupWord)
+    }
+
+    @Test
+    fun startAndDismissSpeakingSession() = runTest(dispatcher) {
+        val api = FakeTaskApi()
+        val model = MainViewModel(api)
+
+        model.startSpeakingSession("daily-1")
+        advanceUntilIdle()
+
+        assertNotNull(model.state.value.activeSpeakingSession)
+        assertEquals("sess-1", model.state.value.activeSpeakingSession?.sessionId)
+        assertEquals(1, model.state.value.speakingSessionTurns.size)
+
+        model.dismissSpeakingSession()
+        assertNull(model.state.value.activeSpeakingSession)
+    }
+
+    @Test
+    fun normalizeTtsVoiceHandlesPrefixesCorrectly() {
+        val (p1, v1) = normalizeTtsVoice("openai:nova", "openai")
+        assertEquals("openai", p1)
+        assertEquals("openai:nova", v1)
+
+        val (p2, v2) = normalizeTtsVoice("aliyun:loongdavid_v2", "openai")
+        assertEquals("aliyun", p2)
+        assertEquals("aliyun:loongdavid_v2", v2)
+
+        val (p3, v3) = normalizeTtsVoice("nova", "openai")
+        assertEquals("openai", p3)
+        assertEquals("openai:nova", v3)
+
+        val (p4, v4) = normalizeTtsVoice("loongdavid_v2", "aliyun")
+        assertEquals("aliyun", p4)
+        assertEquals("aliyun:loongdavid_v2", v4)
+
+        val (p5, v5) = normalizeTtsVoice("openai:openai:nova", "openai")
+        assertEquals("openai", p5)
+        assertEquals("openai:nova", v5)
+    }
+
+    @Test
+    fun setTtsVoiceNeverDuplicatesPrefix() = runTest(dispatcher) {
+        val api = FakeTaskApi()
+        val model = MainViewModel(api)
+
+        model.setTtsVoice("openai:nova")
+        assertEquals("openai:nova", model.state.value.voice)
+        assertEquals("openai", model.state.value.ttsProvider)
+
+        model.setTtsVoice("openai:nova")
+        assertEquals("openai:nova", model.state.value.voice)
+
+        model.setTtsVoice("nova")
+        assertEquals("openai:nova", model.state.value.voice)
+
+        model.setTtsVoice("aliyun:loongdavid_v2")
+        assertEquals("aliyun:loongdavid_v2", model.state.value.voice)
+        assertEquals("aliyun", model.state.value.ttsProvider)
+    }
+
     private class FakeTaskApi : TaskApi {
         var created: CreateTaskRequest? = null
         var createdLong: CreateLongLessonRequest? = null
@@ -405,6 +496,9 @@ class MainViewModelTest {
         val savedProgress = mutableListOf<LearningProgressRequest>()
         val reviewQueueDates = mutableListOf<String>()
         val reportRequests = mutableListOf<String>()
+
+        override suspend fun previewTts(request: TtsDemoRequest): TtsDemoResponse =
+            TtsDemoResponse(voice = request.voice, audioUrl = "/api/v1/tts/demo/preview.mp3")
 
         override suspend fun create(request: CreateTaskRequest): TaskResponse {
             created = request
@@ -574,6 +668,66 @@ class MainViewModelTest {
         }
 
         override suspend fun latestAppRelease(): AppReleaseResponse = error("not used")
+
+        override suspend fun lookupVocabulary(request: LookupVocabularyRequest): LookupVocabularyResponse =
+            LookupVocabularyResponse(
+                word = request.word,
+                phoneticUs = "/test/",
+                definitionCn = "测试定义",
+            )
+
+        override suspend fun saveUserVocabulary(request: SaveUserVocabularyRequest): UserVocabularyCardResponse =
+            UserVocabularyCardResponse(
+                id = 1,
+                clientId = request.clientId,
+                word = request.word,
+                definitionCn = request.definitionCn,
+            )
+
+        override suspend fun getUserVocabulary(
+            clientId: String,
+            limit: Int,
+        ): List<UserVocabularyCardResponse> = listOf(
+            UserVocabularyCardResponse(
+                id = 1,
+                clientId = clientId,
+                word = "concurrency",
+                definitionCn = "并发",
+            )
+        )
+
+        override suspend fun createSpeakingSession(request: CreateSpeakingSessionRequest): SpeakingSessionResponse =
+            SpeakingSessionResponse(
+                sessionId = "sess-1",
+                turnIndex = 1,
+                totalTurns = 3,
+                scenario = request.scenario,
+                role = request.role,
+                aiPromptText = "Tell me about your architecture.",
+            )
+
+        override suspend fun submitSpeakingTurn(
+            sessionId: String,
+            turnIndex: Int,
+            audio: MultipartBody.Part,
+        ): SpeakingTurnResponse = SpeakingTurnResponse(
+            sessionId = sessionId,
+            turnIndex = turnIndex,
+            userTranscript = "I used event queues.",
+            pronunciationScore = 90,
+            grammarScore = 92,
+            quickFeedback = "Great clarity.",
+            isFinished = false,
+        )
+
+        override suspend fun getSpeakingSession(sessionId: String): SpeakingSessionDetailResponse =
+            SpeakingSessionDetailResponse(
+                sessionId = sessionId,
+                clientId = "client-1",
+                contentUuid = "daily-1",
+                scenario = "SYSTEM_DESIGN_INTERVIEW",
+                role = "TECH_LEAD",
+            )
 
         private fun dailyContent() = ContentResponse(
             uuid = "daily-1",

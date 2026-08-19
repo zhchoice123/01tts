@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.tts_service import (
+    _tts_provider_voice,
     _openai_voice,
     _post_speech,
     _split_text,
@@ -13,6 +14,24 @@ from src.tts_service import (
 
 
 class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
+    def test_provider_prefixed_voice_is_parsed(self):
+        self.assertEqual(
+            _tts_provider_voice("aliyun:loongdavid_v2"),
+            ("aliyun", "loongdavid_v2"),
+        )
+        self.assertEqual(_tts_provider_voice("openai:nova"), ("openai", "nova"))
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_unprefixed_voice_defaults_to_aliyun(self):
+        self.assertEqual(
+            ("aliyun", "loongdavid_v2"),
+            _tts_provider_voice("en-US-AvaNeural"),
+        )
+        self.assertEqual(
+            ("aliyun", "loongabby_v2"),
+            _tts_provider_voice("en-US-AndrewNeural"),
+        )
+
     @patch("src.tts_service._transcribe_word_timings")
     @patch("src.tts_service._synthesize_text")
     async def test_generate_audio_uses_openai_speech_and_whisper(
@@ -46,7 +65,7 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             result = await generate_audio(
                 "Hello, world!",
                 target,
-                "en-US-AvaNeural",
+                "openai:nova",
                 word_timings=timings,
                 api_key="test-openai-key",
             )
@@ -54,7 +73,7 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target, result)
         self.assertEqual(2, len(timings))
-        self.assertEqual("nova", synthesize.call_args.kwargs["voice"])
+        self.assertEqual("openai:nova", synthesize.call_args.kwargs["voice"])
         self.assertEqual("tts-1-hd", synthesize.call_args.kwargs["model"])
         self.assertEqual(
             "whisper-1",
@@ -78,7 +97,7 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             await generate_audio(
                 "Retrying audio keeps the lesson playable.",
                 target,
-                "nova",
+                "openai:nova",
                 word_timings=timings,
                 api_key="test-key",
             )
@@ -158,6 +177,8 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             result = await generate_dialogue_audio(
                 turns,
                 target,
+                host_voice="openai:nova",
+                expert_voice="openai:onyx",
                 api_key="test-openai-key",
             )
             self.assertEqual(b"dialogue", target.read_bytes())
@@ -172,7 +193,7 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(target, result)
         self.assertEqual(
-            ["nova", "onyx"],
+            ["openai:nova", "openai:onyx"],
             [call.kwargs["voice"] for call in synthesize.call_args_list],
         )
         self.assertEqual(
@@ -189,3 +210,26 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("nova", _openai_voice("en-US-AvaNeural"))
         self.assertEqual("onyx", _openai_voice("en-US-AndrewNeural"))
         self.assertEqual("shimmer", _openai_voice("shimmer"))
+
+    def test_voice_validation_rejects_invalid_inputs(self):
+        with self.assertRaises(ValueError):
+            _tts_provider_voice("unsupported:voice")
+        with self.assertRaises(ValueError):
+            _tts_provider_voice("aliyun:invalid_voice")
+        with self.assertRaises(ValueError):
+            _tts_provider_voice("openai:invalid_voice")
+        with self.assertRaises(ValueError):
+            _tts_provider_voice("::")
+
+    def test_voice_validation_accepts_valid_inputs(self):
+        self.assertEqual(("aliyun", "loongdavid_v2"), _tts_provider_voice("aliyun:loongdavid_v2"))
+        self.assertEqual(("openai", "nova"), _tts_provider_voice("openai:nova"))
+        with self.assertRaisesRegex(ValueError, "provider:voice"):
+            _tts_provider_voice("openai:openai:nova")
+        with self.assertRaisesRegex(ValueError, "provider:voice"):
+            _tts_provider_voice("openai:garbage:nova")
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(
+                ("aliyun", "loongabby_v2"),
+                _tts_provider_voice("en-US-AndrewNeural"),
+            )

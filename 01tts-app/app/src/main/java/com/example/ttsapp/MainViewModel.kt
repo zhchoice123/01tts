@@ -11,7 +11,15 @@ import com.example.ttsapp.network.LearningDashboardResponse
 import com.example.ttsapp.network.LearningProgressRequest
 import com.example.ttsapp.network.TaskApi
 import com.example.ttsapp.network.TaskResponse
+import com.example.ttsapp.network.TtsDemoRequest
+import com.example.ttsapp.network.CreateSpeakingSessionRequest
+import com.example.ttsapp.network.LookupVocabularyRequest
+import com.example.ttsapp.network.LookupVocabularyResponse
+import com.example.ttsapp.network.SaveUserVocabularyRequest
+import com.example.ttsapp.network.SpeakingSessionResponse
+import com.example.ttsapp.network.SpeakingTurnDetail
 import com.example.ttsapp.network.TopicRecommendationResponse
+import com.example.ttsapp.network.UserVocabularyCardResponse
 import com.example.ttsapp.network.VocabularyProgressRequest
 import com.example.ttsapp.review.LessonReviewReportResponse
 import com.example.ttsapp.review.ReviewContentState
@@ -45,9 +53,43 @@ enum class GenerationStage {
     PROCESSING,
 }
 
+fun normalizeTtsVoice(rawVoice: String, fallbackProvider: String): Pair<String, String> {
+    val clean = rawVoice.trim()
+    val parts = clean.split(":").filter { it.isNotBlank() }
+    val validProviders = setOf("openai", "aliyun")
+
+    return when {
+        parts.isEmpty() -> {
+            val provider = if (fallbackProvider.lowercase() in validProviders) fallbackProvider.lowercase() else "openai"
+            val defaultName = if (provider == "aliyun") "loongdavid_v2" else "nova"
+            provider to "$provider:$defaultName"
+        }
+        parts.size == 1 -> {
+            val provider = if (fallbackProvider.lowercase() in validProviders) fallbackProvider.lowercase() else "openai"
+            val voiceName = parts[0]
+            provider to "$provider:$voiceName"
+        }
+        else -> {
+            val declaredProvider = parts[0].lowercase()
+            if (declaredProvider in validProviders) {
+                val voiceName = parts.last()
+                declaredProvider to "$declaredProvider:$voiceName"
+            } else {
+                val provider = if (fallbackProvider.lowercase() in validProviders) fallbackProvider.lowercase() else "openai"
+                val voiceName = parts.last()
+                provider to "$provider:$voiceName"
+            }
+        }
+    }
+}
+
 data class LearningUiState(
     val prompt: String = "",
     val voice: String = "en-US-AvaNeural",
+    val ttsProvider: String = "openai",
+    val ttsPreviewUrl: String? = null,
+    val ttsPreviewLoading: Boolean = false,
+    val ttsPreviewError: String? = null,
     val difficulty: String = "medium",
     val loading: Boolean = false,
     val generationStage: GenerationStage = GenerationStage.IDLE,
@@ -86,6 +128,14 @@ data class LearningUiState(
     val lessonReviewContentUuid: String? = null,
     val reviewQueueState: ReviewContentState<ReviewQueueResponse> = ReviewContentState.Empty,
     val reviewQueueMessage: String? = null,
+    val selectedLookupWord: LookupVocabularyResponse? = null,
+    val lookupLoading: Boolean = false,
+    val lookupError: String? = null,
+    val activeSpeakingSession: SpeakingSessionResponse? = null,
+    val speakingSessionTurns: List<SpeakingTurnDetail> = emptyList(),
+    val speakingCoachLoading: Boolean = false,
+    val speakingCoachFeedback: String? = null,
+    val userWordbook: List<UserVocabularyCardResponse> = emptyList(),
 )
 
 class MainViewModel(
@@ -96,6 +146,7 @@ class MainViewModel(
     private val clientIdStore: ClientIdStore = InMemoryClientIdStore(),
     private val progressStore: LearningProgressStore = InMemoryLearningProgressStore(),
     private val currentDate: () -> String = { LocalDate.now().toString() },
+    private val ttsStore: TtsPreferenceStore = InMemoryTtsPreferenceStore(),
 ) : ViewModel() {
     private val clientId = clientIdStore.loadOrCreate()
     private var progressSaveJob: Job? = null
@@ -105,6 +156,8 @@ class MainViewModel(
             selectedThemeId = themeStore.load(),
             selectedLanguageId = languageStore.load(),
             clientId = clientId,
+            ttsProvider = ttsStore.load().provider,
+            voice = ttsStore.load().voice,
         )
     )
     val state: StateFlow<LearningUiState> = mutableState.asStateFlow()
@@ -126,7 +179,44 @@ class MainViewModel(
     }
 
     fun setVoice(voice: String) {
-        mutableState.value = state.value.copy(voice = voice)
+        val (provider, normalizedVoice) = normalizeTtsVoice(voice, state.value.ttsProvider)
+        ttsStore.save(TtsPreference(provider, normalizedVoice))
+        mutableState.value = state.value.copy(ttsProvider = provider, voice = normalizedVoice)
+    }
+
+    fun setTtsProvider(provider: String) {
+        val normalized = provider.lowercase().takeIf { it == "openai" || it == "aliyun" } ?: "openai"
+        val defaultVoice = if (normalized == "aliyun") {
+            "aliyun:loongdavid_v2"
+        } else {
+            "openai:nova"
+        }
+        ttsStore.save(TtsPreference(normalized, defaultVoice))
+        mutableState.value = state.value.copy(ttsProvider = normalized, voice = defaultVoice)
+    }
+
+    fun setTtsVoice(voice: String) {
+        setVoice(voice)
+    }
+
+    fun previewTtsVoice() {
+        if (state.value.ttsPreviewLoading) return
+        viewModelScope.launch {
+            mutableState.value = state.value.copy(ttsPreviewLoading = true, ttsPreviewError = null)
+            runCatching { api.previewTts(TtsDemoRequest(state.value.voice)) }
+                .onSuccess {
+                    mutableState.value = state.value.copy(
+                        ttsPreviewLoading = false,
+                        ttsPreviewUrl = it.audioUrl,
+                    )
+                }
+                .onFailure {
+                    mutableState.value = state.value.copy(
+                        ttsPreviewLoading = false,
+                        ttsPreviewError = it.message ?: "TTS preview failed",
+                    )
+                }
+        }
     }
 
     fun setDifficulty(difficulty: String) {
@@ -832,6 +922,155 @@ class MainViewModel(
                     }
                 }
         }
+    }
+
+    fun lookupWord(word: String, context: String? = null) {
+        val clean = word.trim().trim(',', '.', '!', '?', '"', '\'', ';', ':')
+        if (clean.isBlank()) return
+        mutableState.value = state.value.copy(
+            lookupLoading = true,
+            lookupError = null,
+            selectedLookupWord = LookupVocabularyResponse(word = clean, definitionCn = "Loading definition..."),
+        )
+        viewModelScope.launch {
+            try {
+                val resp = api.lookupVocabulary(LookupVocabularyRequest(word = clean, contextSentence = context))
+                mutableState.value = state.value.copy(
+                    lookupLoading = false,
+                    selectedLookupWord = resp,
+                )
+            } catch (e: Exception) {
+                mutableState.value = state.value.copy(
+                    lookupLoading = false,
+                    selectedLookupWord = LookupVocabularyResponse(
+                        word = clean,
+                        definitionCn = "Word: $clean",
+                        contextExplanation = context,
+                    ),
+                    lookupError = e.message,
+                )
+            }
+        }
+    }
+
+    fun dismissWordLookup() {
+        mutableState.value = state.value.copy(selectedLookupWord = null, lookupLoading = false, lookupError = null)
+    }
+
+    fun saveWordToBook(
+        word: String,
+        definitionCn: String,
+        definitionEn: String? = null,
+        phoneticUs: String? = null,
+        context: String? = null,
+        contentUuid: String? = null,
+        startMs: Int? = null,
+        endMs: Int? = null,
+    ) {
+        viewModelScope.launch {
+            try {
+                api.saveUserVocabulary(
+                    SaveUserVocabularyRequest(
+                        clientId = clientId,
+                        word = word,
+                        definitionCn = definitionCn,
+                        definitionEn = definitionEn,
+                        phoneticUs = phoneticUs,
+                        contextSentence = context,
+                        contentUuid = contentUuid,
+                        sentenceStartMs = startMs,
+                        sentenceEndMs = endMs,
+                    )
+                )
+                loadUserWordbook()
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun loadUserWordbook() {
+        viewModelScope.launch {
+            try {
+                val list = api.getUserVocabulary(clientId)
+                mutableState.value = state.value.copy(userWordbook = list)
+            } catch (_: Exception) {}
+        }
+    }
+
+    fun startSpeakingSession(contentUuid: String, scenario: String = "SYSTEM_DESIGN_INTERVIEW", role: String = "TECH_LEAD") {
+        mutableState.value = state.value.copy(speakingCoachLoading = true, speakingCoachFeedback = null)
+        viewModelScope.launch {
+            try {
+                val session = api.createSpeakingSession(
+                    CreateSpeakingSessionRequest(
+                        clientId = clientId,
+                        contentUuid = contentUuid,
+                        scenario = scenario,
+                        role = role,
+                    )
+                )
+                mutableState.value = state.value.copy(
+                    activeSpeakingSession = session,
+                    speakingSessionTurns = listOf(
+                        SpeakingTurnDetail(
+                            turnIndex = 1,
+                            aiPromptText = session.aiPromptText,
+                            aiAudioUrl = session.aiAudioUrl,
+                        )
+                    ),
+                    speakingCoachLoading = false,
+                )
+            } catch (e: Exception) {
+                mutableState.value = state.value.copy(
+                    speakingCoachLoading = false,
+                    speakingCoachFeedback = "Could not start session: ${e.message}",
+                )
+            }
+        }
+    }
+
+    fun submitSpeakingSessionAudio(audioFile: File, turnIndex: Int) {
+        val currentSession = state.value.activeSpeakingSession ?: return
+        mutableState.value = state.value.copy(speakingCoachLoading = true)
+        viewModelScope.launch {
+            try {
+                val reqBody = audioFile.asRequestBody("audio/mp4".toMediaType())
+                val part = MultipartBody.Part.createFormData("audio", audioFile.name, reqBody)
+                val resp = api.submitSpeakingTurn(currentSession.sessionId, turnIndex, part)
+                val updatedTurns = state.value.speakingSessionTurns.toMutableList()
+                val turnIdx = updatedTurns.indexOfFirst { it.turnIndex == turnIndex }
+                if (turnIdx != -1) {
+                    updatedTurns[turnIdx] = updatedTurns[turnIdx].copy(
+                        userTranscript = resp.userTranscript,
+                        pronunciationScore = resp.pronunciationScore,
+                        grammarScore = resp.grammarScore,
+                        quickFeedback = resp.quickFeedback,
+                    )
+                }
+                resp.nextTurn?.let { next ->
+                    updatedTurns.add(
+                        SpeakingTurnDetail(
+                            turnIndex = next.turnIndex,
+                            aiPromptText = next.aiPromptText,
+                            aiAudioUrl = next.aiAudioUrl,
+                        )
+                    )
+                }
+                mutableState.value = state.value.copy(
+                    speakingSessionTurns = updatedTurns,
+                    speakingCoachLoading = false,
+                    speakingCoachFeedback = resp.quickFeedback,
+                )
+            } catch (e: Exception) {
+                mutableState.value = state.value.copy(
+                    speakingCoachLoading = false,
+                    speakingCoachFeedback = "Submission error: ${e.message}",
+                )
+            }
+        }
+    }
+
+    fun dismissSpeakingSession() {
+        mutableState.value = state.value.copy(activeSpeakingSession = null, speakingSessionTurns = emptyList(), speakingCoachLoading = false)
     }
 
     private fun localizedReviewMessage(english: String, chinese: String): String =

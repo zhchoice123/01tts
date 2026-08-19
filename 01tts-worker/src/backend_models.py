@@ -210,6 +210,84 @@ class TopicCandidateRecord(Base):
     )
 
 
+class UserVocabularyCardRecord(Base):
+    __tablename__ = "user_vocabulary_cards"
+    __table_args__ = (
+        UniqueConstraint(
+            "client_id",
+            "normalized_word",
+            name="uq_user_vocabulary_client_word",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    client_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    word: Mapped[str] = mapped_column(String(120), nullable=False)
+    normalized_word: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    phonetic_us: Mapped[str | None] = mapped_column(String(80))
+    phonetic_uk: Mapped[str | None] = mapped_column(String(80))
+    definition_cn: Mapped[str] = mapped_column(Text, nullable=False)
+    definition_en: Mapped[str | None] = mapped_column(Text)
+    context_sentence: Mapped[str | None] = mapped_column(Text)
+    content_uuid: Mapped[str | None] = mapped_column(String(36), index=True)
+    sentence_start_ms: Mapped[int | None] = mapped_column(Integer)
+    sentence_end_ms: Mapped[int | None] = mapped_column(Integer)
+    fsrs_state: Mapped[str] = mapped_column(String(20), nullable=False, default="NEW")
+    stability: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    difficulty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    reps: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    lapses: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    due_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    last_review: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class SpeakingSessionRecord(Base):
+    __tablename__ = "speaking_sessions"
+
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    client_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    content_uuid: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    scenario: Mapped[str] = mapped_column(String(64), nullable=False)
+    role: Mapped[str] = mapped_column(String(64), nullable=False, default="TECH_LEAD")
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="IN_PROGRESS")
+    current_turn: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    total_turns: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
+    topic: Mapped[str | None] = mapped_column(String(255))
+    final_report_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
+class SpeakingSessionTurnRecord(Base):
+    __tablename__ = "speaking_session_turns"
+    __table_args__ = (
+        UniqueConstraint("session_id", "turn_index", name="uq_speaking_session_turn"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    turn_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    ai_prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
+    ai_audio_url: Mapped[str | None] = mapped_column(String(255))
+    user_audio_url: Mapped[str | None] = mapped_column(String(255))
+    user_transcript: Mapped[str | None] = mapped_column(Text)
+    pronunciation_score: Mapped[int | None] = mapped_column(Integer)
+    grammar_score: Mapped[int | None] = mapped_column(Integer)
+    quick_feedback: Mapped[str | None] = mapped_column(Text)
+    evaluation_status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
+    evaluation_error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now
+    )
+
+
 class DailyGenerationRunRecord(Base):
     __tablename__ = "daily_generation_runs"
 

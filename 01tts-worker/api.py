@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -7,7 +8,7 @@ from contextlib import asynccontextmanager
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import redis
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,10 +19,14 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from src.backend_config import BackendConfig, load_backend_config
 from src.backend_models import create_session_factory
 from src.backend_service import BackendService
+from src.tts_service import generate_audio
 
 LOGGER = logging.getLogger("tts-python-api")
 UUID_FILE_PATTERN = re.compile(r"^[0-9a-fA-F-]{36}\.(?:mp3|m4a)$")
 APK_FILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.apk$")
+SPEAKING_SESSION_FILE_PATTERN = re.compile(r"^spk_[0-9a-fA-F]{12}_turn[1-9][0-9]?_(?:ai|user)\.(?:mp3|m4a)$")
+TASK_EVENTS_MAX_ITERATIONS = 60
+TASK_EVENTS_POLL_INTERVAL_SECONDS = 0.5
 
 
 class CreateTaskRequest(BaseModel):
@@ -61,6 +66,20 @@ class CreateDialogueLessonRequest(BaseModel):
     )
     level: str = Field(default="B1", max_length=10)
     sourceMode: str = Field(default="AUTO", max_length=16)
+
+
+class TtsDemoRequest(BaseModel):
+    voice: str = Field(min_length=1, max_length=100)
+    text: str = Field(
+        default="This is a short voice preview from Listening Lab.",
+        min_length=1,
+        max_length=500,
+    )
+
+
+class TtsDemoResponse(BaseModel):
+    voice: str
+    audioUrl: str
 
 
 class CreateAttemptRequest(BaseModel):
@@ -128,6 +147,31 @@ class CreateAnkiReviewLessonRequest(BaseModel):
     topicMode: str = Field(default="DAILY_RECOMMENDED", max_length=32)
     topicId: str | None = Field(default=None, max_length=36)
     words: list[AnkiReviewWordRequest] = Field(min_length=1, max_length=30)
+
+
+class LookupVocabularyRequest(BaseModel):
+    word: str = Field(min_length=1, max_length=120)
+    contextSentence: str | None = Field(default=None, max_length=1000)
+
+
+class SaveUserVocabularyRequest(BaseModel):
+    clientId: UUID
+    word: str = Field(min_length=1, max_length=120)
+    definitionCn: str = Field(min_length=1, max_length=1000)
+    definitionEn: str | None = Field(default=None, max_length=1000)
+    phoneticUs: str | None = Field(default=None, max_length=80)
+    phoneticUk: str | None = Field(default=None, max_length=80)
+    contextSentence: str | None = Field(default=None, max_length=2000)
+    contentUuid: UUID | None = None
+    sentenceStartMs: int | None = Field(default=None, ge=0)
+    sentenceEndMs: int | None = Field(default=None, ge=0)
+
+
+class CreateSpeakingSessionRequest(BaseModel):
+    clientId: UUID
+    contentUuid: UUID
+    scenario: str = Field(default="SYSTEM_DESIGN_INTERVIEW", max_length=64)
+    role: str = Field(default="TECH_LEAD", max_length=64)
 
 
 class AppReleaseManifest(BaseModel):
@@ -222,9 +266,12 @@ def create_app(
 
     @app.post("/api/v1/tasks", status_code=200)
     def create_task(payload: CreateTaskRequest, request: Request) -> dict[str, Any]:
-        return backend(request).create_task(
-            payload.prompt, payload.voice, payload.difficulty
-        )
+        try:
+            return backend(request).create_task(
+                payload.prompt, payload.voice, payload.difficulty
+            )
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
 
     @app.get("/api/v1/tasks/{task_uuid}")
     def get_task(task_uuid: str, request: Request) -> dict[str, Any]:
@@ -609,9 +656,52 @@ def create_app(
     def answer_audio(file_name: str, request: Request):
         return audio_response(backend(request).answer_audio_dir, file_name, "audio/mp4")
 
+    @app.post("/api/v1/tts/demo", response_model=TtsDemoResponse)
+    async def preview_tts(payload: TtsDemoRequest, request: Request):
+        current = backend(request)
+        file_name = f"{uuid4()}.mp3"
+        demo_dir = current.config.storage_dir / "tts-demos"
+        demo_dir.mkdir(parents=True, exist_ok=True)
+        output_path = demo_dir / file_name
+        try:
+            await current.audio_generator(
+                payload.text.strip(),
+                output_path,
+                payload.voice.strip(),
+                api_key=current.config.worker.openai_api_key,
+            )
+        except ValueError as error:
+            output_path.unlink(missing_ok=True)
+            raise HTTPException(400, str(error)) from error
+        except Exception as error:
+            output_path.unlink(missing_ok=True)
+            LOGGER.exception("TTS preview failed")
+            raise HTTPException(502, "TTS preview failed") from error
+        return {"voice": payload.voice.strip(), "audioUrl": f"/api/v1/tts/demo/{file_name}"}
+
+    @app.get("/api/v1/tts/demo/{file_name}")
+    def preview_tts_audio(file_name: str, request: Request):
+        if not UUID_FILE_PATTERN.fullmatch(file_name):
+            raise HTTPException(400, "invalid TTS demo file name")
+        return audio_response(
+            backend(request).config.storage_dir / "tts-demos",
+            file_name,
+            "audio/mpeg",
+        )
+
     @app.get("/api/v1/audio/content/{file_name}")
     def content_audio(file_name: str, request: Request):
         return audio_response(backend(request).content_audio_dir, file_name, "audio/mpeg")
+
+    @app.get("/api/v1/audio/speaking-sessions/{file_name}")
+    def speaking_session_audio(file_name: str, request: Request):
+        media_type = "audio/mp4" if file_name.endswith(".m4a") else "audio/mpeg"
+        return audio_response(
+            backend(request).speaking_session_audio_dir,
+            file_name,
+            media_type,
+            pattern=SPEAKING_SESSION_FILE_PATTERN,
+        )
 
     @app.get("/api/v1/app/releases/latest")
     def latest_app_release(request: Request) -> dict[str, Any]:
@@ -646,14 +736,132 @@ def create_app(
             headers={"Cache-Control": "no-cache"},
         )
 
+    @app.post("/api/v1/vocabulary/lookup")
+    def lookup_vocabulary(payload: LookupVocabularyRequest, request: Request) -> dict[str, Any]:
+        return backend(request).lookup_vocabulary(payload.word, payload.contextSentence)
+
+    @app.post("/api/v1/vocabulary/user-words", status_code=201)
+    def save_user_vocabulary(payload: SaveUserVocabularyRequest, request: Request) -> dict[str, Any]:
+        return backend(request).save_user_vocabulary(
+            client_id=str(payload.clientId),
+            word=payload.word,
+            definition_cn=payload.definitionCn,
+            definition_en=payload.definitionEn,
+            phonetic_us=payload.phoneticUs,
+            phonetic_uk=payload.phoneticUk,
+            context_sentence=payload.contextSentence,
+            content_uuid=str(payload.contentUuid) if payload.contentUuid else None,
+            sentence_start_ms=payload.sentenceStartMs,
+            sentence_end_ms=payload.sentenceEndMs,
+        )
+
+    @app.get("/api/v1/vocabulary/user-words")
+    def get_user_vocabulary(
+        clientId: UUID,
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+    ) -> list[dict[str, Any]]:
+        return backend(request).get_user_vocabulary(str(clientId), limit=limit)
+
+    @app.post("/api/v1/speaking/sessions", status_code=201)
+    async def create_speaking_session(payload: CreateSpeakingSessionRequest, request: Request) -> dict[str, Any]:
+        try:
+            return await backend(request).create_speaking_session(
+                client_id=str(payload.clientId),
+                content_uuid=str(payload.contentUuid),
+                scenario=payload.scenario,
+                role=payload.role,
+            )
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from err
+        except Exception as err:
+            LOGGER.exception("Speaking session creation failed")
+            raise HTTPException(500, "Speaking session creation failed") from err
+
+    @app.post("/api/v1/speaking/sessions/{session_id}/turns")
+    async def submit_speaking_session_turn(
+        session_id: str,
+        turnIndex: Annotated[int, Form(ge=1, le=10)],
+        audio: Annotated[UploadFile, File(...)],
+        request: Request,
+    ) -> dict[str, Any]:
+        audio_bytes = await audio.read()
+        if not audio_bytes:
+            raise HTTPException(400, "audio file cannot be empty")
+        try:
+            return await backend(request).submit_speaking_session_turn(
+                session_id=session_id,
+                turn_index=turnIndex,
+                audio_bytes=audio_bytes,
+                audio_filename=audio.filename or "recording.m4a",
+            )
+        except ValueError as err:
+            raise HTTPException(400, str(err)) from err
+        except Exception as err:
+            LOGGER.exception("Speaking turn processing failed")
+            raise HTTPException(500, "Speaking turn processing failed") from err
+
+    @app.get("/api/v1/speaking/sessions/{session_id}")
+    def get_speaking_session(session_id: str, request: Request) -> dict[str, Any]:
+        result = backend(request).get_speaking_session(session_id)
+        if not result:
+            raise HTTPException(404, "Speaking session not found")
+        return result
+
+    @app.get("/api/v1/tasks/{task_uuid}/events")
+    async def task_events_stream(task_uuid: UUID, request: Request):
+        from fastapi.responses import StreamingResponse
+
+        async def event_generator():
+            uuid_str = str(task_uuid)
+            for i in range(TASK_EVENTS_MAX_ITERATIONS):
+                if await request.is_disconnected():
+                    LOGGER.info("SSE client disconnected for task %s", uuid_str)
+                    break
+                task = backend(request).get_task(uuid_str)
+                if not task:
+                    yield f"event: error\ndata: {json.dumps({'message': 'Task not found'})}\n\n"
+                    break
+                status = task.get("status")
+                yield f"event: status\ndata: {json.dumps(task)}\n\n"
+                if status in ("READY", "COMPLETED"):
+                    yield f"event: ready\ndata: {json.dumps(task)}\n\n"
+                    break
+                elif status == "FAILED":
+                    yield f"event: failed\ndata: {json.dumps(task)}\n\n"
+                    break
+
+                if i % 5 == 0:
+                    import time
+                    yield f"event: heartbeat\ndata: {json.dumps({'timestamp': int(time.time())})}\n\n"
+                await asyncio.sleep(TASK_EVENTS_POLL_INTERVAL_SECONDS)
+            else:
+                yield f"event: timeout\ndata: {json.dumps({'message': 'Task status stream timed out'})}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     return app
 
 
-def audio_response(directory: Path, file_name: str, media_type: str) -> FileResponse:
-    if not UUID_FILE_PATTERN.fullmatch(file_name):
+def audio_response(
+    directory: Path,
+    file_name: str,
+    media_type: str,
+    pattern: re.Pattern[str] = UUID_FILE_PATTERN,
+) -> FileResponse:
+    if not pattern.fullmatch(file_name):
         raise HTTPException(400, "invalid audio file name")
+    resolved_dir = directory.resolve()
     path = (directory / file_name).resolve()
-    if path.parent != directory.resolve() or not path.is_file():
+    if path.parent != resolved_dir or not path.is_file():
         raise HTTPException(404, f"audio {file_name} not found")
     return FileResponse(path, media_type=media_type, headers={"Cache-Control": "no-cache"})
 

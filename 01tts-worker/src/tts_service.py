@@ -30,6 +30,80 @@ OPENAI_VOICES = {
     "shimmer",
 }
 
+ALIYUN_VOICES = {
+    "loongdavid_v2": "David · American male",
+    "loongabby_v2": "Abby · American female",
+    "loongannie_v2": "Annie · American female",
+    "loongeric_v2": "Eric · British male",
+    "loongemily_v2": "Emily · British female",
+}
+ALIYUN_TTS_BASE_URL = os.getenv("ALIYUN_TTS_BASE_URL", "http://127.0.0.1:8088").rstrip("/")
+
+
+def _tts_provider_voice(requested_voice: str) -> tuple[str, str]:
+    """Accept provider-prefixed voices, e.g. aliyun:loongdavid_v2 or openai:nova.
+
+    Raises ValueError on unknown provider or unknown voice for a declared provider.
+    """
+    value = (requested_voice or "").strip()
+    if ":" in value:
+        parts = [part.strip() for part in value.split(":")]
+        if len(parts) != 2 or not all(parts):
+            raise ValueError("TTS voice must use provider:voice format")
+        provider, voice_name = parts
+        provider = provider.lower()
+        if provider not in {"aliyun", "openai"}:
+            raise ValueError(f"Unsupported TTS provider: {provider}")
+        if provider == "aliyun":
+            if voice_name not in ALIYUN_VOICES:
+                raise ValueError(f"Unknown Aliyun voice: {voice_name}")
+            return provider, voice_name
+        else:
+            if voice_name.lower() in OPENAI_VOICES:
+                return provider, voice_name.lower()
+            mapped = _openai_voice(voice_name)
+            if (
+                voice_name.lower() not in OPENAI_VOICES
+                and not any(
+                    marker in voice_name.lower()
+                    for marker in (
+                        "neural",
+                        "alloy",
+                        "ash",
+                        "ballad",
+                        "coral",
+                        "echo",
+                        "fable",
+                        "nova",
+                        "onyx",
+                        "sage",
+                        "shimmer",
+                    )
+                )
+            ):
+                raise ValueError(f"Unknown OpenAI voice: {voice_name}")
+            return provider, mapped
+
+    default_provider = os.getenv("TTS_PROVIDER", "aliyun").strip().lower()
+    provider = default_provider if default_provider in {"aliyun", "openai"} else "aliyun"
+    if provider == "aliyun":
+        if value in ALIYUN_VOICES:
+            return provider, value
+        mapped = {
+            "en-US-AvaNeural": "loongdavid_v2",
+            "en-US-AndrewNeural": "loongabby_v2",
+            "en-GB-SoniaNeural": "loongeric_v2",
+        }.get(value)
+        if mapped:
+            return provider, mapped
+        if not value:
+            return provider, "loongdavid_v2"
+        raise ValueError(f"Unknown Aliyun voice: {value}")
+    else:
+        if not value:
+            return provider, "nova"
+        return provider, _openai_voice(value)
+
 
 def _probe_duration_ms(path: Path) -> int:
     completed = subprocess.run(
@@ -160,6 +234,34 @@ def _post_speech(
     raise RuntimeError(f"OpenAI speech generation failed after 3 attempts: {last_error}")
 
 
+def _post_aliyun_speech(
+    text: str,
+    output_path: Path,
+    *,
+    voice: str,
+    speed: float = 1.0,
+) -> None:
+    rate = round((speed - 1.0) * 100)
+    response = requests.post(
+        f"{ALIYUN_TTS_BASE_URL}/api/synthesize",
+        json={"text": text, "voice": voice, "speechRate": rate},
+        timeout=300,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Aliyun Java TTS request failed ({response.status_code}): {response.text[:500]}"
+        )
+    payload = response.json()
+    audio_url = payload.get("audioUrl")
+    if not audio_url:
+        raise RuntimeError("Aliyun Java TTS response did not include audioUrl")
+    audio = requests.get(f"{ALIYUN_TTS_BASE_URL}{audio_url}", timeout=300)
+    audio.raise_for_status()
+    output_path.write_bytes(audio.content)
+    if output_path.stat().st_size == 0:
+        raise RuntimeError("Aliyun Java TTS returned an empty audio file")
+
+
 def _concat_mp3(segment_paths: list[Path], output_path: Path, work_dir: Path) -> None:
     if not segment_paths:
         raise ValueError("at least one audio segment is required")
@@ -196,7 +298,7 @@ def _synthesize_text(
     text: str,
     output_path: Path,
     *,
-    api_key: str,
+    api_key: str | None,
     model: str,
     voice: str,
     work_dir: Path,
@@ -207,14 +309,14 @@ def _synthesize_text(
     segment_paths: list[Path] = []
     for index, chunk in enumerate(chunks):
         segment_path = work_dir / f"speech-{index:03d}.mp3"
-        _post_speech(
-            chunk,
-            segment_path,
-            api_key=api_key,
-            model=model,
-            voice=voice,
-            speed=speed,
-        )
+        provider, provider_voice = _tts_provider_voice(voice)
+        if provider == "aliyun":
+            _post_aliyun_speech(chunk, segment_path, voice=provider_voice, speed=speed)
+        else:
+            _post_speech(
+                chunk, segment_path, api_key=_require_api_key(api_key), model=model,
+                voice=_openai_voice(provider_voice), speed=speed,
+            )
         segment_paths.append(segment_path)
     _concat_mp3(segment_paths, output_path, work_dir)
 
@@ -348,7 +450,8 @@ async def generate_audio(
     api_key: str | None = None,
 ) -> Path:
     """Generate OpenAI speech and align it with Whisper word timestamps."""
-    resolved_key = _require_api_key(api_key)
+    provider, _ = _tts_provider_voice(voice)
+    resolved_key = api_key if provider == "aliyun" else _require_api_key(api_key)
     tts_model = os.getenv("OPENAI_TTS_MODEL", DEFAULT_TTS_MODEL)
     transcription_model = os.getenv(
         "OPENAI_TRANSCRIPTION_MODEL",
@@ -363,10 +466,12 @@ async def generate_audio(
             output_path,
             api_key=resolved_key,
             model=tts_model,
-            voice=_openai_voice(voice),
+            voice=voice,
             work_dir=temporary_dir,
         )
         try:
+            if not resolved_key:
+                raise RuntimeError("OpenAI key unavailable; using estimated timings")
             boundaries = await asyncio.to_thread(
                 _transcribe_word_timings,
                 output_path,
@@ -397,7 +502,12 @@ async def generate_dialogue_audio(
     """Generate two-voice OpenAI speech and one global Whisper timeline."""
     if not turns:
         raise ValueError("dialogue must contain at least one turn")
-    resolved_key = _require_api_key(api_key)
+    host_provider, _ = _tts_provider_voice(host_voice)
+    expert_provider, _ = _tts_provider_voice(expert_voice)
+    if host_provider == "openai" or expert_provider == "openai":
+        resolved_key = _require_api_key(api_key)
+    else:
+        resolved_key = api_key
     tts_model = os.getenv("OPENAI_TTS_MODEL", DEFAULT_TTS_MODEL)
     transcription_model = os.getenv(
         "OPENAI_TRANSCRIPTION_MODEL",
@@ -428,7 +538,7 @@ async def generate_dialogue_audio(
                 segment_path,
                 api_key=resolved_key,
                 model=tts_model,
-                voice=_openai_voice(voice),
+                voice=voice,
                 work_dir=temporary_dir / f"turn-{index:03d}",
                 speed=0.9,
             )
@@ -473,6 +583,8 @@ async def generate_dialogue_audio(
             start_ms = end_ms
 
         try:
+            if not resolved_key:
+                raise RuntimeError("OpenAI key unavailable; using estimated timings")
             all_words = await asyncio.to_thread(
                 _transcribe_word_timings,
                 output_path,

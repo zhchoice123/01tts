@@ -138,6 +138,9 @@ import com.example.ttsapp.review.ReviewQueueItem
 import com.example.ttsapp.core.notifications.DailyLearningScheduler
 import com.example.ttsapp.core.ai.ProviderKind
 import com.example.ttsapp.core.ai.ProviderRegistry
+import com.example.ttsapp.network.LookupVocabularyResponse
+import com.example.ttsapp.network.SpeakingSessionResponse
+import com.example.ttsapp.network.SpeakingTurnDetail
 import java.io.File
 import java.util.Locale
 import kotlin.math.sqrt
@@ -232,6 +235,7 @@ class MainActivity : ComponentActivity() {
                     PreferencesLanguagePreferenceStore(applicationContext),
                     PreferencesClientIdStore(applicationContext),
                     PreferencesLearningProgressStore(applicationContext),
+                    ttsStore = PreferencesTtsPreferenceStore(applicationContext),
                 )
             }
             val state by model.state.collectAsStateWithLifecycle()
@@ -251,6 +255,11 @@ class MainActivity : ComponentActivity() {
                     recordingState = recordingState.value,
                     recordingAmplitude = recordingAmplitude.floatValue,
                     onRecord = { toggleRecording(model::submitAnswer) },
+                    onRecordCoach = { turnIdx ->
+                        toggleRecording { file ->
+                            model.submitSpeakingSessionAudio(file, turnIdx)
+                        }
+                    },
                     onCancelRecording = ::cancelRecording,
                     onInstallUpdate = ::requestUpdateInstallation,
                 )
@@ -379,6 +388,7 @@ private fun ListeningApp(
     recordingState: RecordingState,
     recordingAmplitude: Float,
     onRecord: () -> Unit,
+    onRecordCoach: (Int) -> Unit = {},
     onCancelRecording: () -> Unit,
     onInstallUpdate: (File) -> Unit,
 ) {
@@ -467,6 +477,36 @@ private fun ListeningApp(
                 themeSheetVisible = false
             },
             onDismiss = { themeSheetVisible = false }
+        )
+    }
+
+    if (state.selectedLookupWord != null) {
+        WordLookupBottomSheet(
+            lookup = state.selectedLookupWord,
+            loading = state.lookupLoading,
+            onDismiss = model::dismissWordLookup,
+            onSaveToWordbook = { word, defCn, defEn, phonetic, context ->
+                model.saveWordToBook(
+                    word = word,
+                    definitionCn = defCn,
+                    definitionEn = defEn,
+                    phoneticUs = phonetic,
+                    context = context,
+                    contentUuid = state.task?.taskUuid,
+                )
+            },
+        )
+    }
+
+    state.activeSpeakingSession?.let { session ->
+        InteractiveSpeakingSheet(
+            session = session,
+            turns = state.speakingSessionTurns,
+            loading = state.speakingCoachLoading,
+            feedback = state.speakingCoachFeedback,
+            onDismiss = model::dismissSpeakingSession,
+            recordingState = recordingState,
+            onRecordCoach = onRecordCoach,
         )
     }
 
@@ -644,6 +684,12 @@ private fun ListeningApp(
                 updateState = updateState,
                 onSelectTheme = model::setTheme,
                 onSelectLanguage = model::setLanguage,
+                onSelectTtsProvider = model::setTtsProvider,
+                onSelectTtsVoice = { selected ->
+                    if (state.ttsProvider == "aliyun") model.setVoice(selected)
+                    else model.setTtsVoice(selected)
+                },
+                onPreviewTts = model::previewTtsVoice,
                 onCheckForUpdate = ::checkForUpdate,
                 onDownloadUpdate = ::downloadUpdate,
                 onInstallUpdate = onInstallUpdate,
@@ -1293,6 +1339,9 @@ private fun SettingsHub(
     updateState: AppUpdateState,
     onSelectTheme: (String) -> Unit,
     onSelectLanguage: (String) -> Unit,
+    onSelectTtsProvider: (String) -> Unit,
+    onSelectTtsVoice: (String) -> Unit,
+    onPreviewTts: () -> Unit,
     onCheckForUpdate: () -> Unit,
     onDownloadUpdate: (com.example.ttsapp.network.AppReleaseResponse) -> Unit,
     onInstallUpdate: (File) -> Unit,
@@ -1394,6 +1443,50 @@ private fun SettingsHub(
                             }
                         }
                     }
+                }
+            }
+        }
+        item {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(localized(selectedLanguageId, "TTS provider and voice", "TTS 模型与音色"), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text(localized(selectedLanguageId, "Choose the provider used for new lessons and preview the selected voice.", "选择新课程使用的服务，并试听当前音色。"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                SelectionRow(
+                    options = listOf(
+                        "openai" to "OpenAI",
+                        "aliyun" to localized(selectedLanguageId, "Aliyun CosyVoice", "阿里云 CosyVoice"),
+                    ),
+                    selected = state.ttsProvider,
+                    onSelect = onSelectTtsProvider,
+                )
+                SelectionRow(
+                    options = if (state.ttsProvider == "aliyun") {
+                        listOf(
+                            "aliyun:loongdavid_v2" to "David · US male",
+                            "aliyun:loongabby_v2" to "Abby · US female",
+                            "aliyun:loongandy_v2" to "Andy · US male",
+                            "aliyun:loongeric_v2" to "Eric · UK male",
+                            "aliyun:loongemily_v2" to "Emily · UK female",
+                        )
+                    } else {
+                        listOf(
+                            "openai:nova" to "Nova",
+                            "openai:onyx" to "Onyx",
+                            "openai:alloy" to "Alloy",
+                        )
+                    },
+                    selected = state.voice,
+                    onSelect = onSelectTtsVoice,
+                )
+                Button(onClick = onPreviewTts, enabled = !state.ttsPreviewLoading) {
+                    Text(if (state.ttsPreviewLoading) localized(selectedLanguageId, "Generating preview…", "正在生成试听…") else localized(selectedLanguageId, "Preview selected voice", "试听当前音色"))
+                }
+                state.ttsPreviewError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+                state.ttsPreviewUrl?.let { url ->
+                    AudioLessonPlayer(
+                        url = ApiClient.resolveMediaUrl(url),
+                        transcriptVisible = false,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
                 }
             }
         }
@@ -1760,12 +1853,27 @@ private fun CreateLessonStep(model: MainViewModel, state: LearningUiState, langu
         FormSection(localized(languageId, "Voice", "语音"), localized(languageId, "A neural voice reads the lesson after generation.", "课程生成后会使用神经网络语音朗读。")) {
             SelectionRow(
                 options = listOf(
-                    "en-US-AvaNeural" to "Ava · US",
-                    "en-US-AndrewNeural" to "Andrew · US",
-                    "en-GB-SoniaNeural" to "Sonia · UK",
+                    "openai" to "OpenAI",
+                    "aliyun" to localized(languageId, "Aliyun CosyVoice", "阿里云 CosyVoice"),
+                ),
+                selected = state.ttsProvider,
+                onSelect = model::setTtsProvider,
+            )
+            Spacer(Modifier.height(8.dp))
+            SelectionRow(
+                options = listOf(
+                    if (state.ttsProvider == "aliyun") "aliyun:loongdavid_v2" to "David · US"
+                    else "en-US-AvaNeural" to "Ava · US",
+                    if (state.ttsProvider == "aliyun") "aliyun:loongabby_v2" to "Abby · US"
+                    else "en-US-AndrewNeural" to "Andrew · US",
+                    if (state.ttsProvider == "aliyun") "aliyun:loongeric_v2" to "Eric · UK"
+                    else "en-GB-SoniaNeural" to "Sonia · UK",
                 ),
                 selected = state.voice,
-                onSelect = model::setVoice,
+                onSelect = { selected ->
+                    if (state.ttsProvider == "aliyun") model.setVoice(selected)
+                    else model.setTtsVoice(selected)
+                },
             )
         }
 
@@ -2032,6 +2140,9 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                             seekSequence += 1
                             seekRequest = PlaybackSeekRequest(seekSequence, startMs)
                         },
+                        onWordClick = { word, sentence ->
+                            model.lookupWord(word, sentence)
+                        },
                     )
                 } else {
                     dialogue.forEachIndexed { index, turn ->
@@ -2043,6 +2154,9 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                             onSeek = { startMs ->
                                 seekSequence += 1
                                 seekRequest = PlaybackSeekRequest(seekSequence, startMs)
+                            },
+                            onWordClick = { word, sentence ->
+                                model.lookupWord(word, sentence)
                             },
                         )
                     }
@@ -2117,7 +2231,7 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                                 listOf(
                                     "LEARNING" to "Review again",
                                     "KNOWN" to "I know this",
-                                ).forEach { (status, label) ->
+                                    ).forEach { (status, label) ->
                                     FilterChip(
                                         selected = state.vocabularyStatuses[item.word] == status,
                                         onClick = { model.reviewVocabulary(item.word, status) },
@@ -2174,6 +2288,18 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
             QuizSection(questions, model::recordQuizResult)
         }
 
+        Button(
+            onClick = {
+                model.startSpeakingSession(task.taskUuid)
+            },
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Icon(Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("AI 角色扮演口语私教 (Interactive Coach)")
+        }
+
         PrimaryButton(
             text = "Continue to speaking practice",
             onClick = model::continueToSpeaking,
@@ -2193,6 +2319,7 @@ private fun DialogueTurnRow(
     activeWordIndex: Int,
     canSeek: Boolean,
     onSeek: (Long) -> Unit,
+    onWordClick: ((String, String) -> Unit)? = null,
 ) {
     val isHost = turn.speaker == "HOST"
     val roleColor = if (isHost) {
@@ -2240,6 +2367,7 @@ private fun DialogueTurnRow(
                 words = turn.words,
                 activeIndex = activeWordIndex,
                 onSeek = onSeek,
+                onWordClick = onWordClick,
             )
             if (canSeek) {
                 Text(
@@ -2299,6 +2427,7 @@ private fun LessonTimedTranscript(
     words: List<WordTiming>,
     activeWord: WordTiming?,
     onSeek: (Long) -> Unit,
+    onWordClick: ((String, String) -> Unit)? = null,
 ) {
     val blocks = remember(text, words) { splitTimedTranscript(text, words) }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -2335,6 +2464,7 @@ private fun LessonTimedTranscript(
                         words = block.words,
                         activeIndex = activeIndex,
                         onSeek = onSeek,
+                        onWordClick = onWordClick,
                     )
                 }
             }
@@ -2348,6 +2478,7 @@ private fun TimedTranscriptText(
     words: List<WordTiming>,
     activeIndex: Int,
     onSeek: (Long) -> Unit,
+    onWordClick: ((String, String) -> Unit)? = null,
 ) {
     var outgoingIndex by remember(words) { mutableIntStateOf(-1) }
     var targetIndex by remember(words) { mutableIntStateOf(activeIndex) }
@@ -2397,7 +2528,10 @@ private fun TimedTranscriptText(
                 start = offset,
                 end = offset,
             ).firstOrNull()?.item?.toIntOrNull()?.let { index ->
-                words.getOrNull(index)?.let { onSeek(it.startMs) }
+                words.getOrNull(index)?.let { wordTiming ->
+                    onSeek(wordTiming.startMs)
+                    onWordClick?.invoke(wordTiming.text, text)
+                }
             }
         },
     )
@@ -3056,5 +3190,259 @@ private fun PrimaryButton(
         ),
     ) {
         Text(text, style = MaterialTheme.typography.labelLarge)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun WordLookupBottomSheet(
+    lookup: LookupVocabularyResponse?,
+    loading: Boolean,
+    onDismiss: () -> Unit,
+    onSaveToWordbook: (String, String, String?, String?, String?) -> Unit,
+) {
+    if (lookup == null) return
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text(
+                        text = lookup.word,
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface,
+                    )
+                    if (!lookup.phoneticUs.isNullOrBlank()) {
+                        Text(
+                            text = "${lookup.phoneticUs} (US)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                    }
+                }
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close")
+                }
+            }
+
+            HorizontalDivider()
+
+            if (loading) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+
+            Text(
+                text = lookup.definitionCn,
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+
+            if (!lookup.definitionEn.isNullOrBlank()) {
+                Text(
+                    text = lookup.definitionEn,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+
+            if (!lookup.contextExplanation.isNullOrBlank()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        text = "Context: ${lookup.contextExplanation}",
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(10.dp),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+
+            if (lookup.collocations.isNotEmpty()) {
+                Text(
+                    text = "Collocations: " + lookup.collocations.joinToString(", "),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.outline,
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            Button(
+                onClick = {
+                    onSaveToWordbook(
+                        lookup.word,
+                        lookup.definitionCn,
+                        lookup.definitionEn,
+                        lookup.phoneticUs,
+                        lookup.contextExplanation,
+                    )
+                    onDismiss()
+                },
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("收藏至生词本 (Add to Wordbook)")
+            }
+            Spacer(Modifier.height(16.dp))
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun InteractiveSpeakingSheet(
+    session: SpeakingSessionResponse,
+    turns: List<SpeakingTurnDetail>,
+    loading: Boolean,
+    feedback: String?,
+    onDismiss: () -> Unit,
+    recordingState: RecordingState,
+    onRecordCoach: (Int) -> Unit,
+) {
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text(
+                        "AI 角色扮演口语私教",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        "${session.scenario} · ${session.role}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                IconButton(onClick = onDismiss) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close")
+                }
+            }
+
+            HorizontalDivider()
+
+            if (loading) {
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f, fill = false),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                items(turns) { turn ->
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            "Round ${turn.turnIndex} - AI Coach:",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        Text(
+                            turn.aiPromptText,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (!turn.userTranscript.isNullOrBlank()) {
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                            Text(
+                                "Your Answer:",
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.secondary,
+                            )
+                            Text(
+                                turn.userTranscript,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                            if (turn.pronunciationScore != null) {
+                                Text(
+                                    "Pronunciation: ${turn.pronunciationScore}  |  Grammar: ${turn.grammarScore}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                )
+                            }
+                            if (!turn.quickFeedback.isNullOrBlank()) {
+                                Text(
+                                    "Feedback: ${turn.quickFeedback}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            val currentTurnIndex = turns.lastOrNull()?.turnIndex ?: 1
+            val lastTurn = turns.lastOrNull()
+
+            if (lastTurn?.userTranscript.isNullOrBlank()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    val recording = recordingState == RecordingState.RECORDING
+                    Button(
+                        onClick = { onRecordCoach(currentTurnIndex) },
+                        modifier = Modifier.weight(1f),
+                        colors = if (recording) ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error) else ButtonDefaults.buttonColors(),
+                    ) {
+                        Icon(if (recording) Icons.Filled.Stop else Icons.Filled.Mic, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (recording) "完成并提交回答" else "按住/点击录音作答")
+                    }
+                }
+            } else {
+                Text(
+                    "对话练习完成！干得漂亮！",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontWeight = FontWeight.Bold,
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+        }
     }
 }

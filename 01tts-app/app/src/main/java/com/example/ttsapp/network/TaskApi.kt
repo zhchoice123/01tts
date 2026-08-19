@@ -19,6 +19,16 @@ data class CreateTaskRequest(
     val difficulty: String = "medium",
 )
 
+data class TtsDemoRequest(
+    val voice: String,
+    val text: String = "This is a short voice preview from Listening Lab.",
+)
+
+data class TtsDemoResponse(
+    val voice: String = "",
+    val audioUrl: String = "",
+)
+
 data class TaskResponse(
     val taskUuid: String,
     val prompt: String,
@@ -221,7 +231,117 @@ data class AppReleaseResponse(
     val publishedAt: String,
 )
 
+data class LookupVocabularyRequest(
+    val word: String,
+    val contextSentence: String? = null,
+)
+
+data class LookupVocabularyResponse(
+    val word: String = "",
+    val phoneticUs: String? = null,
+    val phoneticUk: String? = null,
+    val definitionCn: String = "",
+    val definitionEn: String? = null,
+    val collocations: List<String> = emptyList(),
+    val contextExplanation: String? = null,
+)
+
+data class SaveUserVocabularyRequest(
+    val clientId: String,
+    val word: String,
+    val definitionCn: String,
+    val definitionEn: String? = null,
+    val phoneticUs: String? = null,
+    val phoneticUk: String? = null,
+    val contextSentence: String? = null,
+    val contentUuid: String? = null,
+    val sentenceStartMs: Int? = null,
+    val sentenceEndMs: Int? = null,
+)
+
+data class UserVocabularyCardResponse(
+    val id: Int = 0,
+    val clientId: String = "",
+    val word: String = "",
+    val phoneticUs: String? = null,
+    val phoneticUk: String? = null,
+    val definitionCn: String = "",
+    val definitionEn: String? = null,
+    val contextSentence: String? = null,
+    val contentUuid: String? = null,
+    val sentenceStartMs: Int? = null,
+    val sentenceEndMs: Int? = null,
+    val fsrsState: String = "NEW",
+    val dueTime: String = "",
+    val reps: Int = 0,
+)
+
+data class CreateSpeakingSessionRequest(
+    val clientId: String,
+    val contentUuid: String,
+    val scenario: String = "SYSTEM_DESIGN_INTERVIEW",
+    val role: String = "TECH_LEAD",
+)
+
+data class SpeakingSessionResponse(
+    val sessionId: String = "",
+    val turnIndex: Int = 1,
+    val totalTurns: Int = 3,
+    val scenario: String = "",
+    val role: String = "",
+    val aiPromptText: String = "",
+    val aiAudioUrl: String? = null,
+)
+
+data class NextSpeakingTurn(
+    val turnIndex: Int = 2,
+    val aiPromptText: String = "",
+    val aiAudioUrl: String? = null,
+)
+
+data class SpeakingTurnResponse(
+    val sessionId: String = "",
+    val turnIndex: Int = 1,
+    val evaluationStatus: String = "PENDING",
+    val userTranscript: String? = null,
+    val pronunciationScore: Int? = null,
+    val grammarScore: Int? = null,
+    val quickFeedback: String? = null,
+    val isFinished: Boolean = false,
+    val nextTurn: NextSpeakingTurn? = null,
+)
+
+data class SpeakingTurnDetail(
+    val turnIndex: Int = 1,
+    val aiPromptText: String = "",
+    val aiAudioUrl: String? = null,
+    val userAudioUrl: String? = null,
+    val userTranscript: String? = null,
+    val pronunciationScore: Int? = null,
+    val grammarScore: Int? = null,
+    val quickFeedback: String? = null,
+    val evaluationStatus: String = "PENDING",
+    val evaluationError: String? = null,
+)
+
+data class SpeakingSessionDetailResponse(
+    val sessionId: String = "",
+    val clientId: String = "",
+    val contentUuid: String = "",
+    val scenario: String = "",
+    val role: String = "",
+    val status: String = "IN_PROGRESS",
+    val currentTurn: Int = 1,
+    val totalTurns: Int = 3,
+    val topic: String? = null,
+    val finalReport: Map<String, Any>? = null,
+    val turns: List<SpeakingTurnDetail> = emptyList(),
+)
+
 interface TaskApi {
+    @POST("api/v1/tts/demo")
+    suspend fun previewTts(@Body request: TtsDemoRequest): TtsDemoResponse
+
     @POST("api/v1/tasks")
     suspend fun create(@Body request: CreateTaskRequest): TaskResponse
 
@@ -308,4 +428,30 @@ interface TaskApi {
 
     @GET("api/v1/app/releases/latest")
     suspend fun latestAppRelease(): AppReleaseResponse
+
+    @POST("api/v1/vocabulary/lookup")
+    suspend fun lookupVocabulary(@Body request: LookupVocabularyRequest): LookupVocabularyResponse
+
+    @POST("api/v1/vocabulary/user-words")
+    suspend fun saveUserVocabulary(@Body request: SaveUserVocabularyRequest): UserVocabularyCardResponse
+
+    @GET("api/v1/vocabulary/user-words")
+    suspend fun getUserVocabulary(
+        @Query("clientId") clientId: String,
+        @Query("limit") limit: Int = 50,
+    ): List<UserVocabularyCardResponse>
+
+    @POST("api/v1/speaking/sessions")
+    suspend fun createSpeakingSession(@Body request: CreateSpeakingSessionRequest): SpeakingSessionResponse
+
+    @Multipart
+    @POST("api/v1/speaking/sessions/{sessionId}/turns")
+    suspend fun submitSpeakingTurn(
+        @Path("sessionId") sessionId: String,
+        @Part("turnIndex") turnIndex: Int,
+        @Part audio: MultipartBody.Part,
+    ): SpeakingTurnResponse
+
+    @GET("api/v1/speaking/sessions/{sessionId}")
+    suspend fun getSpeakingSession(@Path("sessionId") sessionId: String): SpeakingSessionDetailResponse
 }

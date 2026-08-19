@@ -236,6 +236,12 @@ class DeepSeekService:
         self.model = model or os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
         self.timeout_seconds = timeout_seconds
 
+    def _thinking_control(self) -> dict[str, Any]:
+        """Use deterministic non-thinking mode for schema-bound JSON generation."""
+        if self.model.startswith("deepseek-v4"):
+            return {"thinking": {"type": "disabled"}}
+        return {}
+
     def generate_lesson(self, prompt: str, metadata: dict[str, Any] | None = None, max_retries: int = 3) -> dict[str, Any]:
         """
         Generate LessonContent JSON via DeepSeek/OpenAI/Moonshot API.
@@ -252,6 +258,7 @@ class DeepSeekService:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={
                         "model": self.model,
+                        **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": 4096,
                         "temperature": 1.0 if self.model.startswith("kimi-k3") else 0.2,
@@ -455,6 +462,7 @@ class DeepSeekService:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={
                         "model": self.model,
+                        **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": max_tokens,
                         "temperature": (
@@ -502,6 +510,7 @@ class DeepSeekService:
                     headers={"Authorization": f"Bearer {self.api_key}"},
                     json={
                         "model": self.model,
+                        **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": max_tokens,
                         "temperature": 1.0 if self.model.startswith("kimi-k3") else 0.35,

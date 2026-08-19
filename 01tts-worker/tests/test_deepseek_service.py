@@ -134,6 +134,7 @@ class DeepSeekServiceTest(unittest.TestCase):
         request_body = mock_post.call_args.kwargs["json"]
         self.assertEqual(4096, request_body["max_tokens"])
         self.assertEqual(0.2, request_body["temperature"])
+        self.assertEqual({"type": "disabled"}, request_body["thinking"])
 
     @patch("src.deepseek_service.requests.post")
     def test_long_lesson_expands_short_response_and_uses_large_token_budget(self, mock_post):

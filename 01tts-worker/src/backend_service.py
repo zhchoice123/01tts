@@ -26,8 +26,11 @@ from src.backend_models import (
     LearningAttemptRecord,
     LearningProgressRecord,
     SpeakingAnswerRecord,
+    SpeakingSessionRecord,
+    SpeakingSessionTurnRecord,
     TaskRecord,
     TopicCandidateRecord,
+    UserVocabularyCardRecord,
     VocabularyProgressRecord,
     utc_now,
 )
@@ -38,7 +41,7 @@ from src.provider_router import ProviderRouter
 from src.review_queue import build_review_queue
 from src.schema_validator import validate_and_repair_lesson_content
 from src.speaking_service import SpeakingAssessmentService
-from src.tts_service import generate_audio, generate_dialogue_audio
+from src.tts_service import _tts_provider_voice, generate_audio, generate_dialogue_audio
 
 LOGGER = logging.getLogger("tts-python-api.service")
 
@@ -195,6 +198,12 @@ class BackendService:
         return self.config.storage_dir / "answers"
 
     @property
+    def speaking_session_audio_dir(self) -> Path:
+        directory = self.config.storage_dir / "speaking-sessions"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
+
+    @property
     def app_release_dir(self) -> Path:
         return self.config.storage_dir / "app-releases"
 
@@ -217,6 +226,7 @@ class BackendService:
         self.threads.clear()
 
     def create_task(self, prompt: str, voice: str, difficulty: str) -> dict[str, Any]:
+        _tts_provider_voice(voice)
         task = TaskRecord(
             task_uuid=str(uuid_module.uuid4()),
             prompt=prompt.strip(),
@@ -1830,6 +1840,443 @@ class BackendService:
             else:
                 missing.append(word)
         return covered, missing
+
+    def lookup_vocabulary(
+        self, word: str, context_sentence: str | None = None
+    ) -> dict[str, Any]:
+        clean_word = re.sub(r"[^\w'-]", "", word.strip())
+        if not clean_word:
+            raise ValueError("Word cannot be empty")
+
+        prompt = (
+            f"Define this English word for a software engineer:\nWord: {clean_word}\n"
+            f"Context sentence: {context_sentence or 'None'}\n\n"
+            "Return JSON only with fields:\n"
+            "- word (string)\n"
+            "- phoneticUs (string, e.g. /.../)\n"
+            "- phoneticUk (string, e.g. /.../)\n"
+            "- definitionCn (concise Chinese definition)\n"
+            "- definitionEn (concise English definition)\n"
+            "- collocations (array of 2-4 strings)\n"
+            "- contextExplanation (string, how it applies to the sentence)"
+        )
+        try:
+            if hasattr(self.generator, "generate_json"):
+                data = self.generator.generate_json(prompt, max_tokens=300, max_retries=1)
+            else:
+                raw = self.generator.generate(prompt)
+                data = json.loads(raw)
+            return {
+                "word": data.get("word", clean_word),
+                "phoneticUs": data.get("phoneticUs", ""),
+                "phoneticUk": data.get("phoneticUk", ""),
+                "definitionCn": data.get("definitionCn", "暂无释义"),
+                "definitionEn": data.get("definitionEn", ""),
+                "collocations": data.get("collocations", []),
+                "contextExplanation": data.get("contextExplanation", ""),
+            }
+        except Exception as err:
+            LOGGER.warning("Vocabulary lookup failed for %s: %s", clean_word, err)
+            return {
+                "word": clean_word,
+                "phoneticUs": "",
+                "phoneticUk": "",
+                "definitionCn": "释义获取中",
+                "definitionEn": "",
+                "collocations": [],
+                "contextExplanation": "",
+            }
+
+    def save_user_vocabulary(
+        self,
+        client_id: str,
+        word: str,
+        definition_cn: str,
+        definition_en: str | None = None,
+        phonetic_us: str | None = None,
+        phonetic_uk: str | None = None,
+        context_sentence: str | None = None,
+        content_uuid: str | None = None,
+        sentence_start_ms: int | None = None,
+        sentence_end_ms: int | None = None,
+    ) -> dict[str, Any]:
+        normalized = word.strip().casefold()
+        with self.session_factory() as session:
+            existing = session.scalar(
+                select(UserVocabularyCardRecord).where(
+                    UserVocabularyCardRecord.client_id == client_id,
+                    UserVocabularyCardRecord.normalized_word == normalized,
+                )
+            )
+            if existing:
+                existing.definition_cn = definition_cn
+                if definition_en:
+                    existing.definition_en = definition_en
+                if phonetic_us:
+                    existing.phonetic_us = phonetic_us
+                if phonetic_uk:
+                    existing.phonetic_uk = phonetic_uk
+                if context_sentence:
+                    existing.context_sentence = context_sentence
+                if content_uuid:
+                    existing.content_uuid = content_uuid
+                existing.updated_at = utc_now()
+                session.commit()
+                record = existing
+            else:
+                record = UserVocabularyCardRecord(
+                    client_id=client_id,
+                    word=word.strip(),
+                    normalized_word=normalized,
+                    phonetic_us=phonetic_us,
+                    phonetic_uk=phonetic_uk,
+                    definition_cn=definition_cn,
+                    definition_en=definition_en,
+                    context_sentence=context_sentence,
+                    content_uuid=content_uuid,
+                    sentence_start_ms=sentence_start_ms,
+                    sentence_end_ms=sentence_end_ms,
+                    fsrs_state="NEW",
+                    stability=0.0,
+                    difficulty=0.0,
+                    reps=0,
+                    lapses=0,
+                    due_time=utc_now(),
+                )
+                session.add(record)
+                session.commit()
+
+            return {
+                "id": record.id,
+                "clientId": record.client_id,
+                "word": record.word,
+                "phoneticUs": record.phonetic_us,
+                "phoneticUk": record.phonetic_uk,
+                "definitionCn": record.definition_cn,
+                "definitionEn": record.definition_en,
+                "contextSentence": record.context_sentence,
+                "contentUuid": record.content_uuid,
+                "fsrsState": record.fsrs_state,
+                "dueTime": record.due_time.isoformat(),
+                "reps": record.reps,
+            }
+
+    def get_user_vocabulary(
+        self, client_id: str, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        with self.session_factory() as session:
+            records = session.scalars(
+                select(UserVocabularyCardRecord)
+                .where(UserVocabularyCardRecord.client_id == client_id)
+                .order_by(UserVocabularyCardRecord.updated_at.desc())
+                .limit(limit)
+            ).all()
+            return [
+                {
+                    "id": r.id,
+                    "clientId": r.client_id,
+                    "word": r.word,
+                    "phoneticUs": r.phonetic_us,
+                    "phoneticUk": r.phonetic_uk,
+                    "definitionCn": r.definition_cn,
+                    "definitionEn": r.definition_en,
+                    "contextSentence": r.context_sentence,
+                    "contentUuid": r.content_uuid,
+                    "sentenceStartMs": r.sentence_start_ms,
+                    "sentenceEndMs": r.sentence_end_ms,
+                    "fsrsState": r.fsrs_state,
+                    "dueTime": r.due_time.isoformat(),
+                    "reps": r.reps,
+                }
+                for r in records
+            ]
+
+    async def create_speaking_session(
+        self,
+        client_id: str,
+        content_uuid: str,
+        scenario: str = "SYSTEM_DESIGN_INTERVIEW",
+        role: str = "TECH_LEAD",
+    ) -> dict[str, Any]:
+        with self.session_factory() as session:
+            content = session.get(ContentRecord, content_uuid)
+            topic_title = content.title if content else "Technical Discussion"
+
+            session_id = f"spk_{uuid_module.uuid4().hex[:12]}"
+            ai_text = (
+                f"Hi there! Let's discuss {topic_title}. "
+                "Could you briefly introduce your approach to handling this in production?"
+            )
+
+            audio_filename = f"{session_id}_turn1_ai.mp3"
+            output_path = self.speaking_session_audio_dir / audio_filename
+            try:
+                await self.audio_generator(ai_text, output_path, voice="en-US-AndrewNeural")
+                ai_audio_url = f"/api/v1/audio/speaking-sessions/{audio_filename}"
+            except Exception as err:
+                LOGGER.error("Could not synthesize AI audio for speaking session: %s", err)
+                raise RuntimeError(
+                    f"Could not synthesize AI audio for speaking session: {err}"
+                ) from err
+
+            session_record = SpeakingSessionRecord(
+                session_id=session_id,
+                client_id=client_id,
+                content_uuid=content_uuid,
+                scenario=scenario,
+                role=role,
+                status="IN_PROGRESS",
+                current_turn=1,
+                total_turns=3,
+                topic=topic_title,
+            )
+            session.add(session_record)
+
+            turn_record = SpeakingSessionTurnRecord(
+                session_id=session_id,
+                turn_index=1,
+                ai_prompt_text=ai_text,
+                ai_audio_url=ai_audio_url,
+                evaluation_status="PENDING",
+            )
+            session.add(turn_record)
+            session.commit()
+
+            return {
+                "sessionId": session_id,
+                "turnIndex": 1,
+                "totalTurns": 3,
+                "scenario": scenario,
+                "role": role,
+                "aiPromptText": ai_text,
+                "aiAudioUrl": ai_audio_url,
+            }
+
+    async def submit_speaking_session_turn(
+        self,
+        session_id: str,
+        turn_index: int,
+        audio_bytes: bytes,
+        audio_filename: str,
+    ) -> dict[str, Any]:
+        with self.session_factory() as session:
+            sess_rec = session.get(SpeakingSessionRecord, session_id)
+            if not sess_rec:
+                raise ValueError(f"Speaking session {session_id} not found")
+
+            if sess_rec.status in ("COMPLETED", "FAILED"):
+                raise ValueError(
+                    f"Speaking session {session_id} is already {sess_rec.status}"
+                )
+
+            turn_rec = session.scalar(
+                select(SpeakingSessionTurnRecord).where(
+                    SpeakingSessionTurnRecord.session_id == session_id,
+                    SpeakingSessionTurnRecord.turn_index == turn_index,
+                )
+            )
+            if not turn_rec:
+                raise ValueError(f"Turn {turn_index} of session {session_id} not found")
+
+            if turn_index > sess_rec.current_turn:
+                raise ValueError(
+                    f"Out of order turn: expected turn {sess_rec.current_turn}, got {turn_index}"
+                )
+
+            if turn_index < sess_rec.current_turn:
+                if turn_rec.user_audio_url:
+                    is_fin = turn_index >= sess_rec.total_turns
+                    next_turn_rec = session.scalar(
+                        select(SpeakingSessionTurnRecord).where(
+                            SpeakingSessionTurnRecord.session_id == session_id,
+                            SpeakingSessionTurnRecord.turn_index == turn_index + 1,
+                        )
+                    )
+                    next_turn_dict = (
+                        {
+                            "turnIndex": next_turn_rec.turn_index,
+                            "aiPromptText": next_turn_rec.ai_prompt_text,
+                            "aiAudioUrl": next_turn_rec.ai_audio_url,
+                        }
+                        if next_turn_rec
+                        else None
+                    )
+                    return {
+                        "sessionId": session_id,
+                        "turnIndex": turn_index,
+                        "evaluationStatus": turn_rec.evaluation_status,
+                        "userTranscript": turn_rec.user_transcript,
+                        "pronunciationScore": turn_rec.pronunciation_score,
+                        "grammarScore": turn_rec.grammar_score,
+                        "quickFeedback": turn_rec.quick_feedback,
+                        "isFinished": is_fin,
+                        "nextTurn": next_turn_dict,
+                    }
+
+            # Save user audio
+            save_name = f"{session_id}_turn{turn_index}_user.m4a"
+            dest_path = self.speaking_session_audio_dir / save_name
+            dest_path.write_bytes(audio_bytes)
+            user_audio_url = f"/api/v1/audio/speaking-sessions/{save_name}"
+
+            user_transcript = None
+            score_p = None
+            score_g = None
+            feedback = None
+            eval_status = "PENDING"
+            eval_error = None
+
+            if self.assessor:
+                try:
+                    user_transcript = self.assessor.transcribe(dest_path)
+                    scoring = self.assessor.score(user_transcript, turn_rec.ai_prompt_text)
+                    score_p = scoring.get("score")
+                    score_g = scoring.get("grammar_score", scoring.get("score"))
+                    feedback = scoring.get("feedback")
+                    eval_status = "COMPLETED"
+                except Exception as err:
+                    LOGGER.warning("Assessor evaluation error: %s", err)
+                    eval_status = "FAILED"
+                    eval_error = "ASSESSMENT_FAILED"
+                    user_transcript = None
+                    score_p = None
+                    score_g = None
+                    feedback = None
+            else:
+                eval_status = "NO_DATA"
+
+            turn_rec.user_audio_url = user_audio_url
+            turn_rec.user_transcript = user_transcript
+            turn_rec.pronunciation_score = score_p
+            turn_rec.grammar_score = score_g
+            turn_rec.quick_feedback = feedback
+            turn_rec.evaluation_status = eval_status
+            turn_rec.evaluation_error = eval_error
+
+            is_finished = turn_index >= sess_rec.total_turns
+            next_turn_data = None
+
+            if not is_finished:
+                next_index = turn_index + 1
+                sess_rec.current_turn = next_index
+
+                ai_next_text = (
+                    "That makes sense. "
+                    "How would you monitor database query latencies in high-concurrency traffic?"
+                )
+                audio_name = f"{session_id}_turn{next_index}_ai.mp3"
+                next_out = self.speaking_session_audio_dir / audio_name
+                try:
+                    await self.audio_generator(
+                        ai_next_text, next_out, voice="en-US-AndrewNeural"
+                    )
+                    ai_audio_url = f"/api/v1/audio/speaking-sessions/{audio_name}"
+                except Exception as err:
+                    LOGGER.error("Could not synthesize next turn audio: %s", err)
+                    sess_rec.status = "FAILED"
+                    session.commit()
+                    raise RuntimeError(
+                        f"Could not synthesize next turn audio: {err}"
+                    ) from err
+
+                next_turn_rec = SpeakingSessionTurnRecord(
+                    session_id=session_id,
+                    turn_index=next_index,
+                    ai_prompt_text=ai_next_text,
+                    ai_audio_url=ai_audio_url,
+                    evaluation_status="PENDING",
+                )
+                session.add(next_turn_rec)
+                next_turn_data = {
+                    "turnIndex": next_index,
+                    "aiPromptText": ai_next_text,
+                    "aiAudioUrl": ai_audio_url,
+                }
+            else:
+                sess_rec.status = "COMPLETED"
+                all_turns = session.scalars(
+                    select(SpeakingSessionTurnRecord).where(
+                        SpeakingSessionTurnRecord.session_id == session_id
+                    )
+                ).all()
+                scored_turns = [
+                    t
+                    for t in all_turns
+                    if t.pronunciation_score is not None and t.grammar_score is not None
+                ]
+                if scored_turns:
+                    avg_p = sum(t.pronunciation_score for t in scored_turns) // len(
+                        scored_turns
+                    )
+                    avg_g = sum(t.grammar_score for t in scored_turns) // len(
+                        scored_turns
+                    )
+                    overall = (avg_p + avg_g) // 2
+                else:
+                    avg_p, avg_g, overall = None, None, None
+                sess_rec.final_report_json = json.dumps(
+                    {
+                        "overallScore": overall,
+                        "fluency": avg_p,
+                        "accuracy": avg_g,
+                        "summary": "Completed all rounds of interactive dialogue.",
+                        "evaluatedTurns": len(scored_turns),
+                    }
+                )
+
+            session.commit()
+
+            return {
+                "sessionId": session_id,
+                "turnIndex": turn_index,
+                "evaluationStatus": eval_status,
+                "userTranscript": user_transcript,
+                "pronunciationScore": score_p,
+                "grammarScore": score_g,
+                "quickFeedback": feedback,
+                "isFinished": is_finished,
+                "nextTurn": next_turn_data,
+            }
+
+    def get_speaking_session(self, session_id: str) -> dict[str, Any] | None:
+        with self.session_factory() as session:
+            sess = session.get(SpeakingSessionRecord, session_id)
+            if not sess:
+                return None
+            turns = session.scalars(
+                select(SpeakingSessionTurnRecord)
+                .where(SpeakingSessionTurnRecord.session_id == session_id)
+                .order_by(SpeakingSessionTurnRecord.turn_index.asc())
+            ).all()
+            return {
+                "sessionId": sess.session_id,
+                "clientId": sess.client_id,
+                "contentUuid": sess.content_uuid,
+                "scenario": sess.scenario,
+                "role": sess.role,
+                "status": sess.status,
+                "currentTurn": sess.current_turn,
+                "totalTurns": sess.total_turns,
+                "topic": sess.topic,
+                "finalReport": json.loads(sess.final_report_json)
+                if sess.final_report_json
+                else None,
+                "turns": [
+                    {
+                        "turnIndex": t.turn_index,
+                        "aiPromptText": t.ai_prompt_text,
+                        "aiAudioUrl": t.ai_audio_url,
+                        "userAudioUrl": t.user_audio_url,
+                        "userTranscript": t.user_transcript,
+                        "pronunciationScore": t.pronunciation_score,
+                        "grammarScore": t.grammar_score,
+                        "quickFeedback": t.quick_feedback,
+                        "evaluationStatus": t.evaluation_status,
+                        "evaluationError": t.evaluation_error,
+                    }
+                    for t in turns
+                ],
+            }
 
 
 class TargetWordCoverageError(ValueError):
