@@ -8,9 +8,4 @@ class ProviderRegistryTest {
     fun deepSeekUsesSupportedModel() {
         assertEquals("deepseek-v4-flash", ProviderRegistry.DEEPSEEK_MODEL)
     }
-
-    @Test
-    fun moonshotUsesKimiK3() {
-        assertEquals("kimi-k3", ProviderRegistry.MOONSHOT_MODEL)
-    }
 }

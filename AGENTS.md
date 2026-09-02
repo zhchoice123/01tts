@@ -9,8 +9,8 @@ and the original lightweight TTS CLI.
   generation, and speaking evaluation.
 - `01tts-app/` is the Kotlin/Compose Android client.
 - Root `main.py`, `src/`, `input/`, and `output/` retain the standalone text-to-MP3 CLI.
-- `LEARNING_LOOP_V3_DEVELOPMENT_PLAN.md` defines the current learning-loop
-  contract and acceptance flow.
+- `LISTENING_LAB_PRODUCT_AND_TECHNICAL_DESIGN.md` defines the current system
+  product requirements, architecture, and learning-loop flow.
 
 Do not commit `venv/`, `__pycache__/`, or generated audio. These are excluded by `.gitignore`.
 

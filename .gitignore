@@ -10,6 +10,7 @@ __pycache__/
 .env
 .env.*
 .idea/
+.vscode/
 .workbuddy/
 **/xcuserdata/
 *.xcuserstate

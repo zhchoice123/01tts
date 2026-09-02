@@ -7,8 +7,7 @@ REPO_DIR="$(cd "$APP_DIR/.." && pwd)"
 BUILD_FILE="$APP_DIR/app/build.gradle.kts"
 REMOTE_HOST="${LISTENING_LAB_DEPLOY_HOST:-tecent-server}"
 REMOTE_RELEASE_DIR="${LISTENING_LAB_RELEASE_DIR:-/opt/01tts/storage-python/app-releases}"
-PUBLIC_API_URL="${LISTENING_LAB_PUBLIC_API_URL:-http://42.192.62.145:8080}"
-FALLBACK_API_URL="${LISTENING_LAB_FALLBACK_API_URL:-http://42.192.62.145:8080}"
+PUBLIC_API_URL="${LISTENING_LAB_PUBLIC_API_URL:-https://api.zhchoice.xyz}"
 MANDATORY_UPDATE="${MANDATORY_UPDATE:-false}"
 
 VERSION_CODE="$(sed -n 's/^[[:space:]]*versionCode = \([0-9][0-9]*\).*/\1/p' "$BUILD_FILE" | head -n 1)"
@@ -77,17 +76,7 @@ ssh "$REMOTE_HOST" \
    mv '$REMOTE_RELEASE_DIR/latest.json.new' '$REMOTE_RELEASE_DIR/latest.json' && \
    rm -f '$REMOTE_APK_TMP' '$REMOTE_MANIFEST_TMP'"
 
-if curl --fail --silent --show-error "$PUBLIC_API_URL/api/v1/app/releases/latest"; then
-  :
-elif ssh "$REMOTE_HOST" \
-  "curl --fail --silent --show-error '$PUBLIC_API_URL/api/v1/app/releases/latest'"; then
-  echo
-  echo "Public HTTPS verified from the cloud host (local network TLS was unavailable)." >&2
-else
-  echo
-  echo "Public HTTPS verification failed; retrying the configured direct server." >&2
-  curl --fail --silent --show-error "$FALLBACK_API_URL/api/v1/app/releases/latest"
-fi
+curl --fail --silent --show-error "$PUBLIC_API_URL/api/v1/app/releases/latest"
 echo
 echo "Published $APK_NAME (versionCode $VERSION_CODE, sha256 $APK_SHA256)"
 echo "Local APK: $DELIVERY_APK"

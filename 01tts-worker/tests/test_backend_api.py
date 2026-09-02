@@ -214,10 +214,8 @@ class BackendApiTest(unittest.TestCase):
             news_sources=["https://news.example.com/rss"],
             deepseek_model="deepseek-test",
             openai_model="openai-test",
-            moonshot_model="kimi-test",
             deepseek_api_key="test",
             openai_api_key="test",
-            moonshot_api_key="test",
         )
         self.config = BackendConfig(
             database_url=f"sqlite:///{root / 'test.db'}",

@@ -8,9 +8,6 @@ server:
 # The unified API creates the daily technical dialogue at 06:00 Asia/Shanghai.
 # Override with DAILY_PLAN_HOUR, DAILY_PLAN_MINUTE, and APP_TIMEZONE.
 
-moonshot:
-  model: kimi-k3
-
 # Optional override. When omitted, the worker rotates the official backend feeds
 # defined in src/config.py.
 news:

@@ -248,15 +248,6 @@ def main() -> None:
                         model=config.deepseek_model,
                     ),
                 ),
-                (
-                    "kimi",
-                    DeepSeekService(
-                        config.moonshot_api_key,
-                        base_url="https://api.moonshot.cn/v1",
-                        model=config.moonshot_model,
-                        timeout_seconds=20,
-                    ),
-                ),
             ]),
             config.server_url,
             config=config,

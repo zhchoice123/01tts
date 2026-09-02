@@ -25,16 +25,15 @@ android {
         applicationId = "com.example.ttsapp"
         minSdk = 26
         targetSdk = 36
-        versionCode = 15
-        versionName = "2.8.3"
+        versionCode = 16
+        versionName = "2.8.4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField(
             "String",
             "API_BASE_URL",
-            "\"${providers.gradleProperty("LISTENING_LAB_API_URL").getOrElse("http://42.192.62.145:8080/")}\"",
+            "\"${providers.gradleProperty("LISTENING_LAB_API_URL").getOrElse("https://api.zhchoice.xyz/")}\"",
         )
         buildConfigField("String", "DEEPSEEK_API_KEY", quotedBuildConfigValue("DEEPSEEK_API_KEY"))
-        buildConfigField("String", "MOONSHOT_API_KEY", quotedBuildConfigValue("MOONSHOT_API_KEY"))
         buildConfigField("String", "OPENAI_API_KEY", quotedBuildConfigValue("OPENAI_API_KEY"))
     }
 

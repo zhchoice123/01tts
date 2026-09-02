@@ -33,7 +33,7 @@ class HttpAiProviderTest {
         MockWebServer().use { server ->
             server.enqueue(MockResponse().setResponseCode(401).setBody("{}"))
             val provider = HttpAiProvider(
-                ProviderKind.MOONSHOT,
+                ProviderKind.OPENAI,
                 server.url("/v1/").toString(),
                 "model",
                 "bad-key",

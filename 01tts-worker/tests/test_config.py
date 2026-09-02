@@ -46,7 +46,6 @@ deepseek:
             self.assertEqual("./my_output", config.audio_output_dir)
             self.assertEqual(["https://news.rss", "https://tech.rss"], config.news_sources)
             self.assertEqual("deepseek-chat", config.deepseek_model)
-            self.assertEqual("kimi-k3", config.moonshot_model)
             # Environment variable takes precedence over file key
             self.assertEqual("deepseek-from-environment", config.deepseek_api_key)
             self.assertEqual("openai-from-environment", config.openai_api_key)

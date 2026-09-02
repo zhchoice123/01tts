@@ -16,7 +16,7 @@ Listening Lab 从单一的“生成听力音频并答题”工具，扩展为个
 
 该 App 仅供本人使用，因此允许提供“设备直连 AI Provider”模式：
 
-- 用户在设置页输入自己的 DeepSeek、Kimi 或 OpenAI API Key。
+- 用户在设置页输入自己的 DeepSeek 或 OpenAI API Key。
 - Key 不写入源码、Gradle 文件或 APK；使用 Android Keystore 包装后保存在本机。
 - 可切换 Provider、模型、超时、温度和每日额度。
 - 云端 Spring Boot 与 Python Worker 继续承担内容同步、网页解析、TTS、转写和耗时任务。
@@ -132,16 +132,14 @@ interface AiProvider {
 实现：
 
 - `DeepSeekProvider`
-- `KimiProvider`
 - `OpenAiProvider`
 - `ServerProvider`：通过 Spring Boot 转发，作为兼容和故障回退。
 
-Provider 设置包含 `baseUrl`、`model`、`apiKeyAlias`、`enabled`。DeepSeek 与 Kimi 均可复用 OpenAI Chat Completions 风格的数据模型；OpenAI 单独实现 Responses API 适配层。业务层只能依赖 `AiProvider`，不能在 UI 中判断厂商。
+Provider 设置包含 `baseUrl`、`model`、`apiKeyAlias`、`enabled`。DeepSeek 使用 Chat Completions 风格的数据模型；OpenAI 单独实现 Responses API 适配层。业务层只能依赖 `AiProvider`，不能在 UI 中判断厂商。
 
 官方接口参考：
 
 - [DeepSeek API](https://api-docs.deepseek.com/)
-- [Kimi API](https://platform.kimi.com/docs/api/overview)
 - [OpenAI API](https://platform.openai.com/docs/quickstart)
 
 ### 5.2 使用分工
@@ -292,7 +290,7 @@ Room 建议实体：
 - [ ] 引入 Room，迁移课程历史、口语成绩和听力成绩。
 - [ ] 拆分 Navigation 与五个一级页面。
 - [ ] 建立统一 `AiProvider` 和设置页。
-- [ ] 完成 DeepSeek/Kimi/OpenAI 连接测试与流式聊天。
+- [ ] 完成 DeepSeek/OpenAI 连接测试与流式聊天。
 - [ ] 增加 API 调用超时、取消、错误分类和用量记录。
 
 验收：切换任意 Provider 后可流式解释一句英文；重启 App 后配置与记录保留。
@@ -393,8 +391,39 @@ mvn clean test
 
 1. Room 数据库与现有历史迁移。
 2. Today、Read、Library 三个导航页面。
-3. Provider 设置页和 DeepSeek/Kimi/OpenAI 连接测试。
+3. Provider 设置页和 DeepSeek/OpenAI 连接测试。
 4. 粘贴英文文本后直接生成阅读课程。
 5. 保存生词、完成三道阅读题并写入历史。
 
 该切片完成后，系统已经从听力工具升级为可每天使用的阅读与词汇产品；之后再接入新闻定时任务、逐句听力和实时口语，风险更低。
+
+---
+
+## 13. AnkiDroid 词汇联动与每日复习系统设计
+
+### 13.1 核心原则与信任边界
+
+1. **AnkiDroid 是唯一 SRS 事实来源**：Listening Lab 不自建独立的“艾宾浩斯”排程，也不修改 Anki 卡片的 `due`、`interval`、`reps` 等排程字段；学习完成后由用户主动前往 AnkiDroid 进行评分与卡片到期推进。
+2. **数据隐私与安全**：云服务器仅接收生成课程所需的词汇快照（最多 30 词），不接收完整 Deck、AnkiWeb 凭据或卡片历史记录。
+3. **明确反馈与原子查重**：单词从阅读界面批量/单个写入 Anki 时，本地自动去重；写入失败与重复项明确分类提示，不回滚已成功写入的卡片。
+
+### 13.2 核心流程
+
+```mermaid
+flowchart LR
+    A["AnkiDroid<br/>本地 Deck 数据库"] <-->|"FlashCardsContract<br/>ContentProvider"| B["Listening Lab (Android)"]
+    B -->|"上传今日到期词快照 (<=30词)"| C["Python FastAPI<br/>/api/v1/anki/review-lessons"]
+    C --> D["DeepSeek<br/>生成 100% 覆盖文章与选择题"]
+    C --> E["TTS 引擎 (Edge/OpenAI/Aliyun)<br/>合成全文音频"]
+    C -->|"返回复习文章 + MP3 + 题目"| B
+```
+
+1. **Deck 绑定**：进入 `Settings → Anki`，请求 `com.ichi2.anki.permission.READ_WRITE_DATABASE` 权限，选择目标 Deck 并完成字段映射。
+2. **今日到期词复习课**：查询 `deck:"..." is:due` 获取今日到期词，提交至云端生成 250–500 词连贯短文（目标词高亮）、全文语音与理解题。云端必须校验目标词 100% 覆盖率，缺失时自动修复。
+3. **新词加入 Anki**：阅读文章时点击生词或批量勾选，直接调用 AnkiDroid Gateway 写入目标 Deck，自动识别标准字段（`英语单词`、`英美音标`、`中文释义`、`英语例句` 等）。
+
+### 13.3 关键接口契约
+
+- `POST /api/v1/anki/review-lessons`：提交当日到期词快照并异步排队生成复习文章。
+- `GET /api/v1/anki/review-lessons/{lesson_uuid}`：轮询获取生成的复习课正文、高亮词汇、MP3 地址与选择题。
+- `GET /api/v1/anki/review-lessons?clientDate=YYYY-MM-DD`：按客户端日期查询当天的复习课历史。

@@ -14,7 +14,7 @@ class DeepSeekServiceTest(unittest.TestCase):
         Here is the lesson:
         ```json
         {
-          "title": "Kimi lesson",
+          "title": "Generated lesson",
           "vocabulary": [
             {"word": "record", "definition": "data carrier",},
           ],
@@ -24,7 +24,7 @@ class DeepSeekServiceTest(unittest.TestCase):
 
         parsed = parse_model_json(content)
 
-        self.assertEqual("Kimi lesson", parsed["title"])
+        self.assertEqual("Generated lesson", parsed["title"])
         self.assertEqual("record", parsed["vocabulary"][0]["word"])
 
     def test_parse_model_json_preserves_commas_inside_strings(self):
@@ -63,26 +63,6 @@ class DeepSeekServiceTest(unittest.TestCase):
         self.assertEqual([], result["dialogue"])
         self.assertEqual(2, mock_post.call_count)
         mock_sleep.assert_called_once()
-
-    @patch("src.deepseek_service.requests.post")
-    def test_kimi_k3_uses_supported_temperature(self, mock_post):
-        mock_response = Mock()
-        mock_response.json.return_value = {
-            "choices": [{"message": {"content": '{"passage":"K3 lesson"}'}}]
-        }
-        mock_response.raise_for_status.return_value = None
-        mock_post.return_value = mock_response
-
-        service = DeepSeekService(
-            api_key="test-key",
-            model="kimi-k3",
-            timeout_seconds=12,
-        )
-        service.generate_lesson("topic", max_retries=1)
-
-        request_body = mock_post.call_args.kwargs["json"]
-        self.assertEqual(1.0, request_body["temperature"])
-        self.assertEqual((10, 12), mock_post.call_args.kwargs["timeout"])
 
     @patch("src.deepseek_service.requests.post")
     def test_generate_lesson_valid_schema(self, mock_post):

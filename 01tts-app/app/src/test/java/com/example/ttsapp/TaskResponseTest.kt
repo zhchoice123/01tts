@@ -10,8 +10,8 @@ import org.junit.Test
 
 class TaskResponseTest {
     @Test
-    fun apiUsesDirectIpServer() {
-        assertEquals("http://42.192.62.145:8080/", ApiClient.BASE_URL)
+    fun apiUsesHttpsDomain() {
+        assertEquals("https://api.zhchoice.xyz/", ApiClient.BASE_URL)
     }
 
     @Test

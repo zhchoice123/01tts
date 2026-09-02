@@ -103,15 +103,6 @@ class BackendService:
                         model=config.worker.deepseek_model,
                     ),
                 ),
-                (
-                    "kimi",
-                    DeepSeekService(
-                        config.worker.moonshot_api_key,
-                        base_url="https://api.moonshot.cn/v1",
-                        model=config.worker.moonshot_model,
-                        timeout_seconds=20,
-                    ),
-                ),
             ]
         )
         self.assessor = assessor or SpeakingAssessmentService(
@@ -990,7 +981,7 @@ class BackendService:
                 source_url=None,
                 published_at=None,
                 source_hash=source_hash,
-                provider="deepseek-kimi-router",
+                provider="deepseek",
                 score=0.7,
                 status="GENERATING",
                 content_uuid=content["uuid"],

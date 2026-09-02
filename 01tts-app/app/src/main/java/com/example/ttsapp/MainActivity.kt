@@ -1351,7 +1351,6 @@ private fun SettingsHub(
     val selectedLanguageId = state.selectedLanguageId
     val providers = listOf(
         Triple(ProviderKind.DEEPSEEK, "DeepSeek", BuildConfig.DEEPSEEK_API_KEY.isNotBlank()),
-        Triple(ProviderKind.MOONSHOT, "Kimi K3", BuildConfig.MOONSHOT_API_KEY.isNotBlank()),
         Triple(ProviderKind.OPENAI, "OpenAI", BuildConfig.OPENAI_API_KEY.isNotBlank()),
     )
     val scope = rememberCoroutineScope()
@@ -1628,13 +1627,6 @@ private fun SettingsHub(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(name, fontWeight = FontWeight.SemiBold)
-                            if (kind == ProviderKind.MOONSHOT) {
-                                Text(
-                                    "Model · kimi-k3",
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                )
-                            }
                         }
                         Text(
                             if (configured) "Configured" else "Missing",

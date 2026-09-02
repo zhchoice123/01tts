@@ -26,10 +26,8 @@ class WorkerConfig:
     news_sources: list[str]
     deepseek_model: str
     openai_model: str
-    moonshot_model: str
     deepseek_api_key: str
     openai_api_key: str
-    moonshot_api_key: str
 
     def __repr__(self) -> str:
         """Sanitized string representation never printing raw API keys or passwords."""
@@ -45,10 +43,8 @@ class WorkerConfig:
             f"news_sources={self.news_sources!r}, "
             f"deepseek_model={self.deepseek_model!r}, "
             f"openai_model={self.openai_model!r}, "
-            f"moonshot_model={self.moonshot_model!r}, "
             f"deepseek_api_key={mask(self.deepseek_api_key)!r}, "
-            f"openai_api_key={mask(self.openai_api_key)!r}, "
-            f"moonshot_api_key={mask(self.moonshot_api_key)!r}"
+            f"openai_api_key={mask(self.openai_api_key)!r}"
             f")"
         )
 
@@ -85,7 +81,6 @@ def load_config(path: Path) -> WorkerConfig:
     # Key Precedence: Environment variables take priority, file config overrides only if env not set
     deepseek_key = os.getenv("DEEPSEEK_API_KEY") or str(_nested(data, "deepseek", "api_key", ""))
     openai_key = os.getenv("OPENAI_API_KEY") or str(_nested(data, "openai", "api_key", ""))
-    moonshot_key = os.getenv("MOONSHOT_API_KEY") or str(_nested(data, "moonshot", "api_key", ""))
 
     return WorkerConfig(
         redis_url=os.getenv(
@@ -113,11 +108,6 @@ def load_config(path: Path) -> WorkerConfig:
             "OPENAI_MODEL",
             str(_nested(data, "openai", "model", "gpt-4o-mini")),
         ),
-        moonshot_model=os.getenv(
-            "MOONSHOT_MODEL",
-            str(_nested(data, "moonshot", "model", "kimi-k3")),
-        ),
         deepseek_api_key=deepseek_key,
         openai_api_key=openai_key,
-        moonshot_api_key=moonshot_key,
     )
