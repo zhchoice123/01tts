@@ -14,14 +14,14 @@ Listening Lab 从单一的“生成听力音频并答题”工具，扩展为个
 
 ## 2. 目标用户与使用假设
 
-该 App 仅供本人使用，因此允许提供“设备直连 AI Provider”模式：
+Android 只访问自有后端，不提供设备直连第三方 AI Provider 的模式：
 
-- 用户在设置页输入自己的 DeepSeek 或 OpenAI API Key。
-- Key 不写入源码、Gradle 文件或 APK；使用 Android Keystore 包装后保存在本机。
-- 可切换 Provider、模型、超时、温度和每日额度。
-- 云端 Spring Boot 与 Python Worker 继续承担内容同步、网页解析、TTS、转写和耗时任务。
+- 用户在设置页只配置界面语言、主题、TTS Provider、音色、提醒和学习偏好。
+- OpenAI、DeepSeek、阿里云等凭据只存在后端运行环境，不能写入源码、Gradle 文件、资源文件或 APK。
+- Android 通过自有后端获取课程、解释、转写、评分和语音结果；后端负责 Provider 选择、重试、限额和日志脱敏。
+- 云端 API 与 Python Worker 继续承担内容同步、网页解析、TTS、转写和耗时任务。
 
-设备直连仍需要互联网，但可以通过流式输出避免等待 Redis 任务完成。正式日志不得打印 Authorization Header 或完整 Key。
+这样可以避免 APK 被反编译后泄露密钥，也便于统一处理 401、429、超时和 Provider 故障。正式日志不得打印 Authorization Header、完整 Key、录音原文或完整用户内容。
 
 ## 3. 产品信息架构
 
@@ -119,23 +119,14 @@ WorkManager 周期任务最小间隔为 15 分钟，实际执行时间受系统�
 
 ### 5.1 统一接口
 
-Android 新增统一抽象：
+Provider 抽象位于后端服务边界。Android 只依赖自有 API 的稳定请求/响应契约，不能感知第三方 API Key、私有 Base URL 或 Provider 连接细节。
 
-```kotlin
-interface AiProvider {
-    fun streamChat(request: ChatRequest): Flow<ChatChunk>
-    suspend fun generateStructured(request: GenerationRequest): LessonContent
-    suspend fun testConnection(): ProviderHealth
-}
-```
+后端 Provider 适配层负责：
 
-实现：
-
-- `DeepSeekProvider`
-- `OpenAiProvider`
-- `ServerProvider`：通过 Spring Boot 转发，作为兼容和故障回退。
-
-Provider 设置包含 `baseUrl`、`model`、`apiKeyAlias`、`enabled`。DeepSeek 使用 Chat Completions 风格的数据模型；OpenAI 单独实现 Responses API 适配层。业务层只能依赖 `AiProvider`，不能在 UI 中判断厂商。
+- 根据业务场景选择文本生成、转写和 TTS Provider。
+- 统一超时、重试、结构化 JSON 校验和错误分类。
+- 对外只返回业务结果或安全的错误信息，不返回 Authorization Header、原始上游响应或完整密钥。
+- 记录模型名称和耗时等可观测信息，但不记录密钥、录音原文和完整用户内容。
 
 官方接口参考：
 
@@ -146,8 +137,8 @@ Provider 设置包含 `baseUrl`、`model`、`apiKeyAlias`、`enabled`。DeepSeek
 
 | 场景 | 推荐执行位置 | 原因 |
 |---|---|---|
-| 句子解释、翻译、即时问答 | Android 直连、流式 | 响应快，不需要持久任务 |
-| 阅读题与课程结构生成 | Android 直连或 Server | 需要结构化 JSON 和重试 |
+| 句子解释、翻译、即时问答 | 自有 API，必要时流式 | 统一权限、限额和日志边界 |
+| 阅读题与课程结构生成 | 自有 API + Worker | 需要结构化 JSON 和重试 |
 | 网页正文提取 | Python Worker | 解析规则、重定向和清洗更稳定 |
 | TTS 音频生成 | Python Worker | Edge TTS 和文件上传已可用 |
 | 录音转写与口语评分 | Python Worker | 文件处理耗时且依赖模型 |
@@ -243,7 +234,7 @@ Room 建议实体：
 - `ReviewScheduleEntity`：下次复习时间、间隔、连续正确次数。
 - `SpeakingAttemptEntity`：录音路径、转写、分数、反馈。
 - `ListeningProgressEntity`：播放位置、速度、完成状态。
-- `ProviderConfigEntity`：Provider、模型、Key 别名，不存明文 Key。
+- Provider 运行配置：Provider、模型和密钥别名只存在后端环境，不进入 Android 本地数据模型。
 
 现有 SharedPreferences 历史应迁移到 Room。迁移完成前保留只读兼容入口，确认成功后再删除旧数据。
 
@@ -286,11 +277,11 @@ Room 建议实体：
 
 - [ ] 引入 Room，迁移课程历史、口语成绩和听力成绩。
 - [ ] 拆分 Navigation 与五个一级页面。
-- [ ] 建立统一 `AiProvider` 和设置页。
-- [ ] 完成 DeepSeek/OpenAI 连接测试与流式聊天。
+- [x] 建立后端 Provider 代理边界，Android 不保存第三方密钥。
+- [ ] 完成首次使用引导和 Today 主任务闭环。
 - [ ] 增加 API 调用超时、取消、错误分类和用量记录。
 
-验收：切换任意 Provider 后可流式解释一句英文；重启 App 后配置与记录保留。
+验收：新用户完成引导后可进入 Today；TTS Provider/音色选择通过后端生效；重启 App 后配置与记录保留。
 
 ### Phase 2：阅读与单词闭环
 
@@ -340,7 +331,7 @@ Room 建议实体：
 
 ### Android
 
-- ViewModel、Room Migration、Provider Adapter 和复习算法单元测试。
+- ViewModel、Preferences/DataStore、Provider Adapter 和复习算法单元测试。
 - MockWebServer 验证流式响应、401、429、超时和 JSON 损坏。
 - Compose UI 测试覆盖 Today、阅读答题、查词、录音和历史恢复。
 - WorkManager 测试覆盖唯一任务、失败重试和通知 Deep Link。
@@ -388,9 +379,9 @@ mvn clean test
 
 1. Room 数据库与现有历史迁移。
 2. Today、Read、Library 三个导航页面。
-3. Provider 设置页和 DeepSeek/OpenAI 连接测试。
-4. 粘贴英文文本后直接生成阅读课程。
-5. 保存生词、完成三道阅读题并写入历史。
+3. 首次使用引导：目标、水平和每日学习时长。
+4. Today 主任务卡与课程五步状态恢复。
+5. 完成一节阅读、听力、答题和口语课程并写入历史。
 
 该切片完成后，系统已经从听力工具升级为可每天使用的阅读与词汇产品；之后再接入新闻定时任务、逐句听力和实时口语，风险更低。
 

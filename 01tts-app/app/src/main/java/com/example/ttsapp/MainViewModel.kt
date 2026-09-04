@@ -27,6 +27,7 @@ import com.example.ttsapp.review.ReviewQueueItem
 import com.example.ttsapp.review.ReviewQueueResponse
 import com.example.ttsapp.review.asContentState
 import java.io.File
+import java.time.Instant
 import java.time.LocalDate
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.delay
@@ -45,6 +46,7 @@ enum class LearningStep {
     CREATE,
     LISTEN,
     SPEAK,
+    REPORT,
 }
 
 enum class GenerationStage {
@@ -52,6 +54,10 @@ enum class GenerationStage {
     SUBMITTING,
     PROCESSING,
 }
+
+private val ONBOARDING_GOALS = setOf("TECHNICAL_ENGLISH", "GENERAL_ENGLISH", "SPEAKING")
+private val ONBOARDING_LEVELS = setOf("A2", "B1", "B2", "C1")
+private val ONBOARDING_MINUTES = setOf(10, 20, 30)
 
 fun normalizeTtsVoice(rawVoice: String, fallbackProvider: String): Pair<String, String> {
     val clean = rawVoice.trim()
@@ -88,6 +94,7 @@ data class LearningUiState(
     val voice: String = "en-US-AvaNeural",
     val ttsProvider: String = "openai",
     val ttsPreviewUrl: String? = null,
+    val ttsPreviewVoice: String? = null,
     val ttsPreviewLoading: Boolean = false,
     val ttsPreviewError: String? = null,
     val difficulty: String = "medium",
@@ -107,6 +114,7 @@ data class LearningUiState(
     val error: String? = null,
     val selectedThemeId: String = "cyber",
     val selectedLanguageId: String = "en",
+    val onboarding: OnboardingState = OnboardingState(),
     val libraryContents: List<ContentResponse> = emptyList(),
     val libraryLoading: Boolean = false,
     val libraryError: String? = null,
@@ -147,20 +155,68 @@ class MainViewModel(
     private val progressStore: LearningProgressStore = InMemoryLearningProgressStore(),
     private val currentDate: () -> String = { LocalDate.now().toString() },
     private val ttsStore: TtsPreferenceStore = InMemoryTtsPreferenceStore(),
+    private val onboardingStore: OnboardingPreferenceStore = InMemoryOnboardingPreferenceStore(),
 ) : ViewModel() {
     private val clientId = clientIdStore.loadOrCreate()
+    private val initialHistory = historyStore.load()
+    private val initialOnboarding = onboardingStore.load(initialHistory.isNotEmpty())
     private var progressSaveJob: Job? = null
     private val mutableState = MutableStateFlow(
         LearningUiState(
-            history = historyStore.load(),
+            history = initialHistory,
             selectedThemeId = themeStore.load(),
             selectedLanguageId = languageStore.load(),
+            onboarding = initialOnboarding,
             clientId = clientId,
             ttsProvider = ttsStore.load().provider,
             voice = ttsStore.load().voice,
         )
     )
     val state: StateFlow<LearningUiState> = mutableState.asStateFlow()
+
+    fun setOnboardingGoal(goal: String) {
+        updateOnboarding { current ->
+            current.copy(goal = goal.takeIf { it in ONBOARDING_GOALS } ?: current.goal)
+        }
+    }
+
+    fun setOnboardingLevel(level: String) {
+        updateOnboarding { current ->
+            current.copy(level = level.takeIf { it in ONBOARDING_LEVELS } ?: current.level)
+        }
+    }
+
+    fun setOnboardingMinutes(minutes: Int) {
+        updateOnboarding { current ->
+            current.copy(
+                dailyMinutes = minutes.takeIf { it in ONBOARDING_MINUTES } ?: current.dailyMinutes,
+            )
+        }
+    }
+
+    fun completeOnboarding() {
+        updateOnboarding { current ->
+            current.copy(completed = true, completedAt = Instant.now().toString())
+        }
+    }
+
+    fun skipOnboarding() {
+        updateOnboarding {
+            it.copy(
+                completed = true,
+                goal = "TECHNICAL_ENGLISH",
+                level = "B1",
+                dailyMinutes = 20,
+                completedAt = Instant.now().toString(),
+            )
+        }
+    }
+
+    private fun updateOnboarding(transform: (OnboardingState) -> OnboardingState) {
+        val updated = transform(state.value.onboarding)
+        onboardingStore.save(updated)
+        mutableState.value = state.value.copy(onboarding = updated)
+    }
 
     fun setTheme(themeId: String) {
         val validThemeId = AppThemeStyle.fromId(themeId).id
@@ -181,7 +237,13 @@ class MainViewModel(
     fun setVoice(voice: String) {
         val (provider, normalizedVoice) = normalizeTtsVoice(voice, state.value.ttsProvider)
         ttsStore.save(TtsPreference(provider, normalizedVoice))
-        mutableState.value = state.value.copy(ttsProvider = provider, voice = normalizedVoice)
+        mutableState.value = state.value.copy(
+            ttsProvider = provider,
+            voice = normalizedVoice,
+            ttsPreviewUrl = null,
+            ttsPreviewVoice = null,
+            ttsPreviewError = null,
+        )
     }
 
     fun setTtsProvider(provider: String) {
@@ -192,7 +254,13 @@ class MainViewModel(
             "openai:nova"
         }
         ttsStore.save(TtsPreference(normalized, defaultVoice))
-        mutableState.value = state.value.copy(ttsProvider = normalized, voice = defaultVoice)
+        mutableState.value = state.value.copy(
+            ttsProvider = normalized,
+            voice = defaultVoice,
+            ttsPreviewUrl = null,
+            ttsPreviewVoice = null,
+            ttsPreviewError = null,
+        )
     }
 
     fun setTtsVoice(voice: String) {
@@ -201,20 +269,49 @@ class MainViewModel(
 
     fun previewTtsVoice() {
         if (state.value.ttsPreviewLoading) return
+        val requestedVoice = state.value.voice
+        val requestedProvider = state.value.ttsProvider
         viewModelScope.launch {
-            mutableState.value = state.value.copy(ttsPreviewLoading = true, ttsPreviewError = null)
-            runCatching { api.previewTts(TtsDemoRequest(state.value.voice)) }
-                .onSuccess {
-                    mutableState.value = state.value.copy(
-                        ttsPreviewLoading = false,
-                        ttsPreviewUrl = it.audioUrl,
-                    )
+            mutableState.value = state.value.copy(
+                ttsPreviewLoading = true,
+                ttsPreviewUrl = null,
+                ttsPreviewVoice = requestedVoice,
+                ttsPreviewError = null,
+            )
+            runCatching { api.previewTts(TtsDemoRequest(requestedVoice)) }
+                .onSuccess { response ->
+                    val actualVoice = normalizeTtsVoice(
+                        response.voice.ifBlank { requestedVoice },
+                        requestedProvider,
+                    ).second
+                    mutableState.value = if (state.value.voice == requestedVoice) {
+                        if (response.audioUrl.isBlank()) {
+                            state.value.copy(
+                                ttsPreviewLoading = false,
+                                ttsPreviewUrl = null,
+                                ttsPreviewError = "The TTS service returned no playable audio.",
+                            )
+                        } else {
+                            state.value.copy(
+                                ttsPreviewLoading = false,
+                                ttsPreviewUrl = response.audioUrl,
+                                ttsPreviewVoice = actualVoice,
+                            )
+                        }
+                    } else {
+                        state.value.copy(ttsPreviewLoading = false)
+                    }
                 }
-                .onFailure {
-                    mutableState.value = state.value.copy(
-                        ttsPreviewLoading = false,
-                        ttsPreviewError = it.message ?: "TTS preview failed",
-                    )
+                .onFailure { error ->
+                    mutableState.value = if (state.value.voice == requestedVoice) {
+                        state.value.copy(
+                            ttsPreviewLoading = false,
+                            ttsPreviewUrl = null,
+                            ttsPreviewError = ttsPreviewErrorMessage(error),
+                        )
+                    } else {
+                        state.value.copy(ttsPreviewLoading = false)
+                    }
                 }
         }
     }
@@ -241,6 +338,30 @@ class MainViewModel(
                     mutableState.value = state.value.copy(
                         dailyLoading = false,
                         dailyError = it.message ?: "Today's lesson could not be synchronized.",
+                    )
+                }
+            refreshLibrary()
+            refreshDashboard()
+        }
+    }
+
+    fun generateDailyPlan() {
+        if (state.value.dailyLoading) return
+        viewModelScope.launch {
+            mutableState.value = state.value.copy(dailyLoading = true, dailyError = null)
+            runCatching { api.generateDailyPlan(currentDate()) }
+                .onSuccess {
+                    mutableState.value = state.value.copy(
+                        dailyPlan = it,
+                        dailyLoading = false,
+                        dailyError = null,
+                    )
+                    restoreProgress(it.contentUuid)
+                }
+                .onFailure {
+                    mutableState.value = state.value.copy(
+                        dailyLoading = false,
+                        dailyError = it.message ?: "Today's lesson could not be generated.",
                     )
                 }
             refreshLibrary()
@@ -472,6 +593,7 @@ class MainViewModel(
 
     private fun openReadyContent(content: ContentResponse, topicsLoading: Boolean? = null) {
         val task = content.asTaskResponse()
+        val restoredProgress = progressStore.load(task.taskUuid)
         val history = (
             listOf(LessonHistoryEntry(task)) +
                 state.value.history.filterNot { it.task.taskUuid == task.taskUuid }
@@ -481,7 +603,8 @@ class MainViewModel(
             topicsLoading = topicsLoading ?: state.value.topicsLoading,
             task = task,
             history = history,
-            step = LearningStep.LISTEN,
+            step = if (restoredProgress?.completed == true) LearningStep.REPORT else LearningStep.LISTEN,
+            currentProgress = restoredProgress,
         )
         restoreProgress(task.taskUuid)
     }
@@ -585,6 +708,7 @@ class MainViewModel(
 
     fun openLesson(entry: LessonHistoryEntry) {
         val task = entry.task
+        val restoredProgress = progressStore.load(task.taskUuid)
         mutableState.value = state.value.copy(
             prompt = task.prompt,
             voice = task.voice,
@@ -593,7 +717,8 @@ class MainViewModel(
             answer = entry.answer,
             quizCorrect = entry.quizCorrect,
             quizTotal = entry.quizTotal,
-            step = LearningStep.LISTEN,
+            step = if (restoredProgress?.completed == true) LearningStep.REPORT else LearningStep.LISTEN,
+            currentProgress = restoredProgress,
             error = null,
         )
         restoreProgress(task.taskUuid)
@@ -670,6 +795,14 @@ class MainViewModel(
         }
     }
 
+    fun showCompletionReport() {
+        val progress = state.value.currentProgress ?: return
+        if (progress.completed) {
+            mutableState.value = state.value.copy(step = LearningStep.REPORT)
+            loadLessonReview(progress.contentUuid)
+        }
+    }
+
     fun returnToLesson() {
         mutableState.value = state.value.copy(step = LearningStep.LISTEN)
     }
@@ -712,6 +845,9 @@ class MainViewModel(
                 mutableState.value = state.value.copy(evaluating = false, answer = it)
                 updateLearningProgress { progress ->
                     progress.copy(speakingScore = it.score)
+                }
+                if (state.value.currentProgress?.completed == true) {
+                    mutableState.value = state.value.copy(step = LearningStep.REPORT)
                 }
             }.onFailure {
                 mutableState.value = state.value.copy(
@@ -791,6 +927,13 @@ class MainViewModel(
                                 state.value.todayProgress
                             },
                             learningSyncMessage = null,
+                            step = if (
+                                openNow && merged.completed && state.value.step == LearningStep.LISTEN
+                            ) {
+                                LearningStep.REPORT
+                            } else {
+                                state.value.step
+                            },
                         )
                     }
                     if (merged.completed) {
@@ -883,6 +1026,19 @@ class MainViewModel(
                 quizTotal > 0 && speakingScore != null
             ),
     )
+
+    private fun ttsPreviewErrorMessage(error: Throwable): String = when {
+        error is HttpException && error.code() == 429 ->
+            "Voice preview is temporarily rate-limited. Please try again shortly."
+        error is HttpException && error.code() in setOf(400, 404, 422) ->
+            "This voice is currently unavailable. Select another voice and try again."
+        error is HttpException && error.code() >= 500 ->
+            "The TTS service is temporarily unavailable. Please try again later."
+        error.message.orEmpty().contains("timeout", ignoreCase = true) ->
+            "Voice preview timed out. Check your connection and try again."
+        else -> error.message?.takeIf { it.isNotBlank() }
+            ?: "Voice preview failed. Check your connection and try again."
+    }
 
     private fun loadLessonReview(contentUuid: String, force: Boolean = false) {
         val progress = progressStore.load(contentUuid)

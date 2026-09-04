@@ -148,6 +148,23 @@ class MainViewModelTest {
     }
 
     @Test
+    fun generateDailyPlanUsesClientDateAndRestoresTheGeneratedLesson() = runTest(dispatcher) {
+        val api = FakeTaskApi()
+        val model = MainViewModel(
+            api = api,
+            currentDate = { "2026-08-18" },
+        )
+
+        model.generateDailyPlan()
+        advanceUntilIdle()
+
+        assertEquals(listOf("2026-08-18"), api.generatedPlanDates)
+        assertEquals("daily-1", model.state.value.dailyPlan?.contentUuid)
+        assertFalse(model.state.value.dailyLoading)
+        assertNull(model.state.value.dailyError)
+    }
+
+    @Test
     fun longLessonSubmissionReturnsImmediatelyWithoutPolling() = runTest(dispatcher) {
         val api = FakeTaskApi()
         val model = MainViewModel(api)
@@ -199,6 +216,51 @@ class MainViewModelTest {
         )
         assertEquals("nordic", restored.state.value.selectedThemeId)
         assertEquals("zh", restored.state.value.selectedLanguageId)
+    }
+
+    @Test
+    fun onboardingSelectionsPersistAndCompletionDoesNotRepeat() {
+        val onboardingStore = InMemoryOnboardingPreferenceStore()
+        val model = MainViewModel(
+            api = FakeTaskApi(),
+            onboardingStore = onboardingStore,
+        )
+
+        assertFalse(model.state.value.onboarding.completed)
+        model.setOnboardingGoal("SPEAKING")
+        model.setOnboardingLevel("B2")
+        model.setOnboardingMinutes(30)
+        model.completeOnboarding()
+
+        val restored = MainViewModel(
+            api = FakeTaskApi(),
+            onboardingStore = onboardingStore,
+        )
+        assertTrue(restored.state.value.onboarding.completed)
+        assertEquals("SPEAKING", restored.state.value.onboarding.goal)
+        assertEquals("B2", restored.state.value.onboarding.level)
+        assertEquals(30, restored.state.value.onboarding.dailyMinutes)
+        assertNotNull(restored.state.value.onboarding.completedAt)
+    }
+
+    @Test
+    fun existingHistoryAutomaticallySkipsNewOnboarding() {
+        val historyStore = InMemoryLessonHistoryStore().apply {
+            save(listOf(LessonHistoryEntry(task = TaskResponse(
+                taskUuid = "legacy-1",
+                prompt = "Explain locks",
+                voice = "openai:nova",
+                difficulty = "B1",
+                status = "COMPLETED",
+            ))))
+        }
+        val model = MainViewModel(
+            api = FakeTaskApi(),
+            historyStore = historyStore,
+            onboardingStore = InMemoryOnboardingPreferenceStore(),
+        )
+
+        assertTrue(model.state.value.onboarding.completed)
     }
 
     @Test
@@ -377,6 +439,7 @@ class MainViewModelTest {
         advanceUntilIdle()
 
         assertTrue(model.state.value.currentProgress?.completed == true)
+        assertEquals(LearningStep.REPORT, model.state.value.step)
         assertEquals(listOf("daily-1"), api.reportRequests)
         assertTrue(model.state.value.lessonReviewState is ReviewContentState.Data)
     }
@@ -482,6 +545,62 @@ class MainViewModelTest {
         assertEquals("aliyun", model.state.value.ttsProvider)
     }
 
+    @Test
+    fun ttsPreviewKeepsRequestedAndActualVoiceAligned() = runTest(dispatcher) {
+        val api = FakeTaskApi().apply {
+            previewResponseVoice = "aliyun:loongabby_v2"
+        }
+        val model = MainViewModel(api)
+        model.setTtsProvider("aliyun")
+        model.setTtsVoice("aliyun:loongabby_v2")
+
+        model.previewTtsVoice()
+        advanceUntilIdle()
+
+        assertEquals("aliyun:loongabby_v2", api.lastPreviewRequest?.voice)
+        assertEquals("aliyun:loongabby_v2", model.state.value.ttsPreviewVoice)
+        assertEquals("/api/v1/tts/demo/preview.mp3", model.state.value.ttsPreviewUrl)
+        assertNull(model.state.value.ttsPreviewError)
+
+        model.setTtsVoice("aliyun:loongdavid_v2")
+        assertNull(model.state.value.ttsPreviewVoice)
+        assertNull(model.state.value.ttsPreviewUrl)
+    }
+
+    @Test
+    fun completedLessonReopensAtCompletionReport() {
+        val progressStore = InMemoryLearningProgressStore().apply {
+            save(
+                LearningProgressRequest(
+                    clientId = "client",
+                    contentUuid = "task-1",
+                    vocabularyDone = true,
+                    listeningDone = true,
+                    readingDone = true,
+                    quizCorrect = 4,
+                    quizTotal = 5,
+                    speakingScore = 86,
+                    completed = true,
+                )
+            )
+        }
+        val entry = LessonHistoryEntry(
+            task = TaskResponse(
+                taskUuid = "task-1",
+                prompt = "Explain locks",
+                voice = "openai:nova",
+                difficulty = "medium",
+                status = "COMPLETED",
+            )
+        )
+        val model = MainViewModel(FakeTaskApi(), progressStore = progressStore)
+
+        model.openLesson(entry)
+
+        assertEquals(LearningStep.REPORT, model.state.value.step)
+        assertTrue(model.state.value.currentProgress?.completed == true)
+    }
+
     private class FakeTaskApi : TaskApi {
         var created: CreateTaskRequest? = null
         var createdLong: CreateLongLessonRequest? = null
@@ -496,9 +615,17 @@ class MainViewModelTest {
         val savedProgress = mutableListOf<LearningProgressRequest>()
         val reviewQueueDates = mutableListOf<String>()
         val reportRequests = mutableListOf<String>()
+        val generatedPlanDates = mutableListOf<String>()
+        var previewResponseVoice: String? = null
+        var lastPreviewRequest: TtsDemoRequest? = null
 
-        override suspend fun previewTts(request: TtsDemoRequest): TtsDemoResponse =
-            TtsDemoResponse(voice = request.voice, audioUrl = "/api/v1/tts/demo/preview.mp3")
+        override suspend fun previewTts(request: TtsDemoRequest): TtsDemoResponse {
+            lastPreviewRequest = request
+            return TtsDemoResponse(
+                voice = previewResponseVoice ?: request.voice,
+                audioUrl = "/api/v1/tts/demo/preview.mp3",
+            )
+        }
 
         override suspend fun create(request: CreateTaskRequest): TaskResponse {
             created = request
@@ -530,6 +657,13 @@ class MainViewModelTest {
             contentUuid = "daily-1",
             content = dailyContent(),
         )
+
+        override suspend fun generateDailyPlan(planDate: String): DailyPlanResponse =
+            DailyPlanResponse(
+                planDate = planDate,
+                contentUuid = "daily-1",
+                content = dailyContent(),
+            ).also { generatedPlanDates += planDate }
 
         override suspend fun library(): List<ContentResponse> = listOf(
             dailyContent(),

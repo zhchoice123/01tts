@@ -361,6 +361,11 @@ interface TaskApi {
     @GET("api/v1/daily-plans/today")
     suspend fun today(): DailyPlanResponse
 
+    @POST("api/v1/daily-plans/{planDate}/generate")
+    suspend fun generateDailyPlan(
+        @Path("planDate") planDate: String,
+    ): DailyPlanResponse
+
     @GET("api/v1/library")
     suspend fun library(): List<ContentResponse>
 

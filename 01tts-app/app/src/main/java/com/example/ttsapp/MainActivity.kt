@@ -137,6 +137,7 @@ import com.example.ttsapp.review.LessonReviewReportCard
 import com.example.ttsapp.review.ReviewQueueItem
 import com.example.ttsapp.core.notifications.DailyLearningScheduler
 import com.example.ttsapp.network.LookupVocabularyResponse
+import com.example.ttsapp.network.LearningProgressRequest
 import com.example.ttsapp.network.SpeakingSessionResponse
 import com.example.ttsapp.network.SpeakingTurnDetail
 import java.io.File
@@ -238,6 +239,7 @@ class MainActivity : ComponentActivity() {
                     PreferencesClientIdStore(applicationContext),
                     PreferencesLearningProgressStore(applicationContext),
                     ttsStore = PreferencesTtsPreferenceStore(applicationContext),
+                    onboardingStore = PreferencesOnboardingPreferenceStore(applicationContext),
                 )
             }
             val state by model.state.collectAsStateWithLifecycle()
@@ -451,11 +453,13 @@ private fun ListeningApp(
         }
     }
 
-    LaunchedEffect(Unit) {
-        model.refreshDaily()
-        model.refreshTopics()
-        updateState = AppUpdateState.Checking
-        updateState = updateManager.checkForUpdate()
+    LaunchedEffect(state.onboarding.completed) {
+        if (state.onboarding.completed) {
+            model.refreshDaily()
+            model.refreshTopics()
+            updateState = AppUpdateState.Checking
+            updateState = updateManager.checkForUpdate()
+        }
     }
 
     LaunchedEffect(
@@ -478,6 +482,19 @@ private fun ListeningApp(
         ) {
             onCancelRecording()
         }
+    }
+
+    if (!state.onboarding.completed) {
+        OnboardingScreen(
+            state = state,
+            languageId = state.selectedLanguageId,
+            onSelectGoal = model::setOnboardingGoal,
+            onSelectLevel = model::setOnboardingLevel,
+            onSelectMinutes = model::setOnboardingMinutes,
+            onComplete = model::completeOnboarding,
+            onSkip = model::skipOnboarding,
+        )
+        return
     }
 
     if (historyVisible) {
@@ -551,7 +568,7 @@ private fun ListeningApp(
                     if (state.step != LearningStep.CREATE) {
                         IconButton(
                             onClick = {
-                                if (state.step == LearningStep.SPEAK) {
+                                if (state.step == LearningStep.SPEAK || state.step == LearningStep.REPORT) {
                                     model.returnToLesson()
                                 } else {
                                     model.startNewLesson()
@@ -625,6 +642,7 @@ private fun ListeningApp(
                     }
                 },
                 onRefresh = model::refreshDaily,
+                onGenerate = model::generateDailyPlan,
                 onReviewQueueRetry = model::refreshReviewQueue,
                 onLessonReviewRetry = model::refreshLessonReview,
                 onReviewQueueItem = { item ->
@@ -656,7 +674,15 @@ private fun ListeningApp(
                         .fillMaxSize()
                         .padding(padding),
                 ) {
-                    StepIndicator(state.step, state.selectedLanguageId)
+                    if (state.step == LearningStep.CREATE || state.task == null) {
+                        StepIndicator(state.step, state.selectedLanguageId)
+                    } else {
+                        LessonJourneyIndicator(
+                            progress = state.currentProgress,
+                            step = state.step,
+                            languageId = state.selectedLanguageId,
+                        )
+                    }
                     AnimatedVisibility(state.error != null) {
                         ErrorPanel(
                             message = state.error.orEmpty(),
@@ -680,6 +706,11 @@ private fun ListeningApp(
                                 recordingAmplitude = recordingAmplitude,
                                 onRecord = onRecord,
                                 onCancelRecording = onCancelRecording,
+                            )
+                            LearningStep.REPORT -> CompletionReportStep(
+                                model = model,
+                                state = state,
+                                onBackToToday = { destination = AppDestination.TODAY },
                             )
                         }
                     }
@@ -724,11 +755,213 @@ private fun ListeningApp(
 }
 
 @Composable
+private fun OnboardingScreen(
+    state: LearningUiState,
+    languageId: String,
+    onSelectGoal: (String) -> Unit,
+    onSelectLevel: (String) -> Unit,
+    onSelectMinutes: (Int) -> Unit,
+    onComplete: () -> Unit,
+    onSkip: () -> Unit,
+) {
+    var step by rememberSaveable { mutableIntStateOf(0) }
+    val progress = (step + 1) / 3f
+    val goals = listOf(
+        "TECHNICAL_ENGLISH" to localized(languageId, "Technical English", "技术英语"),
+        "GENERAL_ENGLISH" to localized(languageId, "General English", "日常英语"),
+        "SPEAKING" to localized(languageId, "Speaking confidence", "口语提升"),
+    )
+    val levels = listOf("A2", "B1", "B2", "C1")
+    val minutes = listOf(10, 20, 30)
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(24.dp),
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            Spacer(Modifier.height(18.dp))
+            Text("Listening Lab", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
+            Text(
+                localized(languageId, "Build a daily English habit", "建立每天都能完成的英语训练"),
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                localized(
+                    languageId,
+                    "A short setup helps us choose a useful first lesson. You can change these choices later.",
+                    "用不到一分钟完成设置，我们就能为你准备更合适的第一节课。之后可以随时修改。",
+                ),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            LinearProgressIndicator(
+                progress = { progress },
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Text(
+                localized(languageId, "Step ${step + 1} of 3", "第 ${step + 1} / 3 步"),
+                color = MaterialTheme.colorScheme.primary,
+                style = MaterialTheme.typography.labelLarge,
+            )
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceVariant,
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    when (step) {
+                        0 -> {
+                            Text(
+                                localized(languageId, "What do you want to improve?", "你想优先提升什么？"),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                localized(languageId, "Your goal shapes the first topics and practice prompts.", "你的选择会影响第一批主题和练习问题。"),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            goals.forEach { (id, label) ->
+                                SelectionOption(
+                                    label = label,
+                                    selected = state.onboarding.goal == id,
+                                    onClick = { onSelectGoal(id) },
+                                )
+                            }
+                        }
+                        1 -> {
+                            Text(
+                                localized(languageId, "What feels comfortable today?", "你现在的英语水平更接近哪一档？"),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                localized(languageId, "You can adjust the difficulty from the lesson screen.", "之后可以在课程页面调整难度。"),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            levels.forEach { level ->
+                                SelectionOption(
+                                    label = level,
+                                    supporting = when (level) {
+                                        "A2" -> localized(languageId, "Clear, familiar topics", "熟悉主题，表达清晰")
+                                        "B1" -> localized(languageId, "Everyday technical explanations", "日常技术表达")
+                                        "B2" -> localized(languageId, "Longer articles and opinions", "较长文章与观点表达")
+                                        else -> localized(languageId, "Dense ideas and precise language", "复杂观点与精准表达")
+                                    },
+                                    selected = state.onboarding.level == level,
+                                    onClick = { onSelectLevel(level) },
+                                )
+                            }
+                        }
+                        else -> {
+                            Text(
+                                localized(languageId, "How much time do you have?", "每天准备投入多长时间？"),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                localized(languageId, "We will use this to set a realistic daily target.", "我们会据此设置一个更容易坚持的每日目标。"),
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            minutes.forEach { value ->
+                                SelectionOption(
+                                    label = localized(languageId, "$value minutes", "$value 分钟"),
+                                    supporting = when (value) {
+                                        10 -> localized(languageId, "A focused warm-up", "一次专注热身")
+                                        20 -> localized(languageId, "A complete daily session", "一套完整日常训练")
+                                        else -> localized(languageId, "More listening and speaking practice", "更多听力和口语练习")
+                                    },
+                                    selected = state.onboarding.dailyMinutes == value,
+                                    onClick = { onSelectMinutes(value) },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Button(
+                onClick = {
+                    if (step == 2) onComplete() else step += 1
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    if (step == 2) {
+                        localized(languageId, "Start learning", "开始学习")
+                    } else {
+                        localized(languageId, "Continue", "继续")
+                    }
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(
+                    onClick = { if (step > 0) step -= 1 },
+                    enabled = step > 0,
+                ) {
+                    Text(localized(languageId, "Back", "上一步"))
+                }
+                TextButton(onClick = onSkip) {
+                    Text(localized(languageId, "Skip for now", "暂时跳过"))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectionOption(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    supporting: String? = null,
+) {
+    Surface(
+        onClick = onClick,
+        color = if (selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(
+            width = if (selected) 2.dp else 1.dp,
+            color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline,
+        ),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(label, fontWeight = FontWeight.SemiBold)
+                supporting?.let {
+                    Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+            if (selected) {
+                Icon(Icons.Default.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            }
+        }
+    }
+}
+
+@Composable
 private fun TodayHub(
     state: LearningUiState,
     languageId: String,
     onStart: () -> Unit,
     onRefresh: () -> Unit,
+    onGenerate: () -> Unit,
     onReviewQueueRetry: () -> Unit,
     onLessonReviewRetry: () -> Unit,
     onReviewQueueItem: (ReviewQueueItem) -> Unit,
@@ -744,6 +977,14 @@ private fun TodayHub(
         localized(languageId, "Spoken summary", "口语总结") to (progress?.speakingScore != null),
     )
     val completedCount = journey.count { it.second }
+    val productState = when {
+        state.dailyPlan == null && state.dailyLoading -> localized(languageId, "Preparing", "准备中")
+        state.dailyPlan == null -> localized(languageId, "Not ready", "尚未准备")
+        state.dailyPlan.content.status != "READY" -> localized(languageId, "Preparing audio", "音频准备中")
+        progress?.completed == true -> localized(languageId, "Completed", "已完成")
+        completedCount > 0 -> localized(languageId, "In progress", "进行中")
+        else -> localized(languageId, "Ready to start", "可以开始")
+    }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(20.dp),
@@ -810,6 +1051,11 @@ private fun TodayHub(
                     }
 
                     val plan = state.dailyPlan
+                    Text(
+                        productState,
+                        color = MaterialTheme.colorScheme.primary,
+                        style = MaterialTheme.typography.labelLarge,
+                    )
                     Text(
                         if (plan == null) localized(languageId, "Today's session", "今日课程")
                         else "${plan.planDate} · ${plan.estimatedMinutes} ${localized(languageId, "minutes", "分钟")}",
@@ -883,7 +1129,9 @@ private fun TodayHub(
                     }
                     if (plan?.content?.status == "READY") {
                         PrimaryButton(
-                            text = if (state.task?.taskUuid == plan.content.uuid) {
+                            text = if (progress?.completed == true) {
+                                localized(languageId, "Review today's lesson", "复习今日课程")
+                            } else if (completedCount > 0 || state.task?.taskUuid == plan.content.uuid) {
                                 localized(languageId, "Continue today's lesson", "继续今日课程")
                             } else {
                                 localized(languageId, "Start today's learning", "开始今日学习")
@@ -897,14 +1145,23 @@ private fun TodayHub(
                             else localized(languageId, "Audio generation is still in progress.", "课程音频仍在生成中。"),
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
-                        OutlinedButton(
-                            onClick = onRefresh,
-                            enabled = !state.dailyLoading,
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Icon(Icons.Default.Refresh, contentDescription = null)
-                            Spacer(Modifier.width(8.dp))
-                            Text(if (state.dailyLoading) localized(languageId, "Checking…", "检查中…") else localized(languageId, "Check again", "重新检查"))
+                        if (plan == null) {
+                            PrimaryButton(
+                                text = if (state.dailyLoading) localized(languageId, "Preparing today's lesson…", "正在准备今日课程…") else localized(languageId, "Prepare today's lesson", "准备今日课程"),
+                                onClick = onGenerate,
+                                enabled = !state.dailyLoading,
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            OutlinedButton(
+                                onClick = onRefresh,
+                                enabled = !state.dailyLoading,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Icon(Icons.Default.Refresh, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                                Text(if (state.dailyLoading) localized(languageId, "Checking…", "检查中…") else localized(languageId, "Check again", "重新检查"))
+                            }
                         }
                     }
                     state.dailyError?.let {
@@ -1357,6 +1614,29 @@ private fun LibraryHub(
     }
 }
 
+private fun ttsVoiceOptions(provider: String): List<Pair<String, String>> =
+    if (provider == "aliyun") {
+        listOf(
+            "aliyun:loongdavid_v2" to "Aliyun · David · US male",
+            "aliyun:loongabby_v2" to "Aliyun · Abby · US female",
+            "aliyun:loongannie_v2" to "Aliyun · Annie · US female",
+            "aliyun:loongeric_v2" to "Aliyun · Eric · UK male",
+            "aliyun:loongemily_v2" to "Aliyun · Emily · UK female",
+        )
+    } else {
+        listOf(
+            "openai:nova" to "OpenAI · Nova",
+            "openai:onyx" to "OpenAI · Onyx",
+            "openai:alloy" to "OpenAI · Alloy",
+        )
+    }
+
+private fun ttsVoiceDisplayName(voice: String): String =
+    (ttsVoiceOptions("aliyun") + ttsVoiceOptions("openai"))
+        .firstOrNull { it.first == voice }
+        ?.second
+        ?: voice
+
 @Composable
 private fun SettingsHub(
     state: LearningUiState,
@@ -1390,7 +1670,7 @@ private fun SettingsHub(
     ) {
         item {
             Text(localized(selectedLanguageId, "Settings", "设置"), style = MaterialTheme.typography.headlineMedium)
-            Text(localized(selectedLanguageId, "Language, theme, updates and AI provider configuration.", "配置界面语言、主题、应用更新和 AI 服务。"), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(localized(selectedLanguageId, "Language, theme, TTS voice, updates and privacy.", "配置界面语言、TTS 音色、应用更新和隐私。"), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         item {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1485,34 +1765,58 @@ private fun SettingsHub(
                     onSelect = onSelectTtsProvider,
                 )
                 SelectionRow(
-                    options = if (state.ttsProvider == "aliyun") {
-                        listOf(
-                            "aliyun:loongdavid_v2" to "David · US male",
-                            "aliyun:loongabby_v2" to "Abby · US female",
-                            "aliyun:loongandy_v2" to "Andy · US male",
-                            "aliyun:loongeric_v2" to "Eric · UK male",
-                            "aliyun:loongemily_v2" to "Emily · UK female",
-                        )
-                    } else {
-                        listOf(
-                            "openai:nova" to "Nova",
-                            "openai:onyx" to "Onyx",
-                            "openai:alloy" to "Alloy",
-                        )
-                    },
+                    options = ttsVoiceOptions(state.ttsProvider),
                     selected = state.voice,
                     onSelect = onSelectTtsVoice,
                 )
-                Button(onClick = onPreviewTts, enabled = !state.ttsPreviewLoading) {
-                    Text(if (state.ttsPreviewLoading) localized(selectedLanguageId, "Generating preview…", "正在生成试听…") else localized(selectedLanguageId, "Preview selected voice", "试听当前音色"))
+                Text(
+                    localized(
+                        selectedLanguageId,
+                        "Selected: ${ttsVoiceDisplayName(state.voice)}",
+                        "当前选择：${ttsVoiceDisplayName(state.voice)}",
+                    ),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                Button(
+                    onClick = onPreviewTts,
+                    enabled = !state.ttsPreviewLoading,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        if (state.ttsPreviewLoading) {
+                            localized(
+                                selectedLanguageId,
+                                "Generating ${ttsVoiceDisplayName(state.ttsPreviewVoice ?: state.voice)}…",
+                                "正在生成 ${ttsVoiceDisplayName(state.ttsPreviewVoice ?: state.voice)}…",
+                            )
+                        } else {
+                            localized(
+                                selectedLanguageId,
+                                "Preview ${ttsVoiceDisplayName(state.voice)}",
+                                "试听 ${ttsVoiceDisplayName(state.voice)}",
+                            )
+                        }
+                    )
                 }
                 state.ttsPreviewError?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 state.ttsPreviewUrl?.let { url ->
-                    AudioLessonPlayer(
-                        url = ApiClient.resolveMediaUrl(url),
-                        transcriptVisible = false,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            localized(
+                                selectedLanguageId,
+                                "Playing: ${ttsVoiceDisplayName(state.ttsPreviewVoice ?: state.voice)} · ${state.ttsPreviewVoice ?: state.voice}",
+                                "正在试听：${ttsVoiceDisplayName(state.ttsPreviewVoice ?: state.voice)} · ${state.ttsPreviewVoice ?: state.voice}",
+                            ),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        AudioLessonPlayer(
+                            url = ApiClient.resolveMediaUrl(url),
+                            transcriptVisible = false,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
         }
@@ -1867,6 +2171,98 @@ private fun StepIndicator(activeStep: LearningStep, languageId: String) {
 }
 
 @Composable
+private fun LessonJourneyIndicator(
+    progress: LearningProgressRequest?,
+    step: LearningStep,
+    languageId: String,
+) {
+    val completed = listOf(
+        progress?.vocabularyDone == true,
+        progress?.listeningDone == true,
+        progress?.readingDone == true,
+        (progress?.quizTotal ?: 0) > 0,
+        progress?.speakingScore != null,
+    )
+    val labels = listOf(
+        localized(languageId, "Words", "词汇"),
+        localized(languageId, "Listen", "听力"),
+        localized(languageId, "Read", "阅读"),
+        localized(languageId, "Quiz", "答题"),
+        localized(languageId, "Speak", "口语"),
+    )
+    val activeIndex = when (step) {
+        LearningStep.SPEAK -> 4
+        LearningStep.REPORT -> 5
+        else -> completed.indexOfFirst { !it }.takeIf { it >= 0 } ?: 5
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            labels.forEachIndexed { index, label ->
+                val isComplete = completed[index]
+                val isCurrent = index == activeIndex
+                Column(
+                    modifier = Modifier.weight(1f),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(if (isCurrent) 5.dp else 3.dp)
+                            .clip(CircleShape)
+                            .background(
+                                when {
+                                    isComplete -> MaterialTheme.colorScheme.primary
+                                    isCurrent -> MaterialTheme.colorScheme.secondary
+                                    else -> MaterialTheme.colorScheme.outline
+                                }
+                            ),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (isComplete) {
+                            Icon(
+                                Icons.Default.Check,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(13.dp),
+                            )
+                            Spacer(Modifier.width(2.dp))
+                        }
+                        Text(
+                            label,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isCurrent || isComplete) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
+                }
+            }
+        }
+        Text(
+            if (activeIndex >= labels.size) {
+                localized(languageId, "Lesson complete", "课程已完成")
+            } else {
+                localized(
+                    languageId,
+                    "Next: ${labels[activeIndex]}",
+                    "下一步：${labels[activeIndex]}",
+                )
+            },
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+        )
+    }
+}
+
+@Composable
 private fun CreateLessonStep(model: MainViewModel, state: LearningUiState, languageId: String) {
     Column(
         modifier = Modifier
@@ -1928,19 +2324,9 @@ private fun CreateLessonStep(model: MainViewModel, state: LearningUiState, langu
             )
             Spacer(Modifier.height(8.dp))
             SelectionRow(
-                options = listOf(
-                    if (state.ttsProvider == "aliyun") "aliyun:loongdavid_v2" to "David · US"
-                    else "en-US-AvaNeural" to "Ava · US",
-                    if (state.ttsProvider == "aliyun") "aliyun:loongabby_v2" to "Abby · US"
-                    else "en-US-AndrewNeural" to "Andrew · US",
-                    if (state.ttsProvider == "aliyun") "aliyun:loongeric_v2" to "Eric · UK"
-                    else "en-GB-SoniaNeural" to "Sonia · UK",
-                ),
+                options = ttsVoiceOptions(state.ttsProvider),
                 selected = state.voice,
-                onSelect = { selected ->
-                    if (state.ttsProvider == "aliyun") model.setVoice(selected)
-                    else model.setTtsVoice(selected)
-                },
+                onSelect = model::setTtsVoice,
             )
         }
 
@@ -2168,6 +2554,19 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                     model.onPlaybackProgress(positionMs, durationMs)
                 },
             )
+        } ?: Surface(
+            color = MaterialTheme.colorScheme.errorContainer,
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Text(
+                localized(
+                    state.selectedLanguageId,
+                    "Audio is not available for this lesson. Create another lesson or try again later.",
+                    "本课程暂时没有可播放的音频，请重新生成课程或稍后再试。",
+                ),
+                modifier = Modifier.padding(14.dp),
+                color = MaterialTheme.colorScheme.onErrorContainer,
+            )
         }
         if ((progress?.positionMs ?: 0L) > 0) {
             Text(
@@ -2339,6 +2738,15 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                     )
                 }
             }
+        } else {
+            LessonDataEmptyState(
+                title = localized(state.selectedLanguageId, "Vocabulary unavailable", "暂无词汇数据"),
+                message = localized(
+                    state.selectedLanguageId,
+                    "This step cannot be completed until the lesson contains vocabulary.",
+                    "课程包含词汇数据后才能完成此步骤。",
+                ),
+            )
         }
 
         if (questions.isNotEmpty()) {
@@ -2353,6 +2761,15 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
                 }
             }
             QuizSection(questions, model::recordQuizResult)
+        } else {
+            LessonDataEmptyState(
+                title = localized(state.selectedLanguageId, "Quiz unavailable", "暂无答题数据"),
+                message = localized(
+                    state.selectedLanguageId,
+                    "No questions were returned, so the quiz is not marked complete.",
+                    "服务端未返回题目，因此答题步骤不会被标记为完成。",
+                ),
+            )
         }
 
         Button(
@@ -2367,15 +2784,47 @@ private fun ListenLessonStep(model: MainViewModel, state: LearningUiState) {
             Text("AI 角色扮演口语私教 (Interactive Coach)")
         }
 
+        val readyForSpeaking = progress?.vocabularyDone == true &&
+            progress.listeningDone &&
+            progress.readingDone &&
+            progress.quizTotal > 0
+        val lessonCompleted = progress?.completed == true
         PrimaryButton(
-            text = "Continue to speaking practice",
-            onClick = model::continueToSpeaking,
+            text = when {
+                lessonCompleted -> localized(state.selectedLanguageId, "View completion report", "查看完成报告")
+                readyForSpeaking -> localized(state.selectedLanguageId, "Continue to speaking practice", "继续口语练习")
+                else -> localized(state.selectedLanguageId, "Complete the four steps above first", "请先完成上面的四个步骤")
+            },
+            onClick = if (lessonCompleted) model::showCompletionReport else model::continueToSpeaking,
+            enabled = readyForSpeaking || lessonCompleted,
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedButton(onClick = model::startNewLesson, modifier = Modifier.fillMaxWidth()) {
             Text("Create another lesson")
         }
         Spacer(Modifier.height(20.dp))
+    }
+}
+
+@Composable
+private fun LessonDataEmptyState(title: String, message: String) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
     }
 }
 
@@ -3024,6 +3473,130 @@ private fun SpeakingStep(
 }
 
 @Composable
+private fun CompletionReportStep(
+    model: MainViewModel,
+    state: LearningUiState,
+    onBackToToday: () -> Unit,
+) {
+    val task = state.task
+    val progress = state.currentProgress?.takeIf { it.contentUuid == task?.taskUuid }
+    val languageId = state.selectedLanguageId
+    val reviewedWords = state.vocabularyStatuses
+        .takeIf { it.isNotEmpty() }
+        ?.values
+        ?.count { it == "KNOWN" || it == "LEARNING" }
+    val incorrectAnswers = if ((progress?.quizTotal ?: 0) > 0) {
+        ((progress?.quizTotal ?: 0) - (progress?.quizCorrect ?: 0)).coerceAtLeast(0)
+    } else {
+        null
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                localized(languageId, "Lesson complete", "课程已完成"),
+                style = MaterialTheme.typography.headlineMedium,
+            )
+            Text(
+                task?.prompt.orEmpty().ifBlank {
+                    localized(languageId, "Your listening lesson", "你的听力课程")
+                },
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+            shape = RoundedCornerShape(16.dp),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+        ) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Text(
+                    localized(languageId, "Actual results", "本课实际结果"),
+                    style = MaterialTheme.typography.titleLarge,
+                )
+                CompletionResultRow(
+                    localized(languageId, "Vocabulary", "词汇"),
+                    if (progress?.vocabularyDone == true) {
+                        localized(languageId, "Completed", "已完成")
+                    } else localized(languageId, "No data", "暂无数据"),
+                )
+                CompletionResultRow(
+                    localized(languageId, "Listening", "听力"),
+                    if (progress?.listeningDone == true) {
+                        localized(languageId, "Completed", "已完成")
+                    } else localized(languageId, "No data", "暂无数据"),
+                )
+                CompletionResultRow(
+                    localized(languageId, "Reading", "阅读"),
+                    if (progress?.readingDone == true) {
+                        localized(languageId, "Completed", "已完成")
+                    } else localized(languageId, "No data", "暂无数据"),
+                )
+                CompletionResultRow(
+                    localized(languageId, "Quiz", "答题"),
+                    if ((progress?.quizTotal ?: 0) > 0) {
+                        "${progress?.quizCorrect ?: 0} / ${progress?.quizTotal}"
+                    } else localized(languageId, "No data", "暂无数据"),
+                )
+                CompletionResultRow(
+                    localized(languageId, "Speaking", "口语"),
+                    progress?.speakingScore?.let { "$it / 100" }
+                        ?: localized(languageId, "No data", "暂无数据"),
+                )
+                CompletionResultRow(
+                    localized(languageId, "Reviewed words", "已复习词汇"),
+                    reviewedWords?.toString() ?: localized(languageId, "No data", "暂无数据"),
+                )
+                CompletionResultRow(
+                    localized(languageId, "Incorrect answers", "错题"),
+                    incorrectAnswers?.toString() ?: localized(languageId, "No data", "暂无数据"),
+                )
+            }
+        }
+
+        LessonReviewReportCard(
+            state = state.lessonReviewState,
+            languageId = languageId,
+            onRetry = model::refreshLessonReview,
+            onNextAction = { model.returnToLesson() },
+        )
+
+        PrimaryButton(
+            text = localized(languageId, "Practice speaking again", "重新练习口语"),
+            onClick = model::continueToSpeaking,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedButton(onClick = model::returnToLesson, modifier = Modifier.fillMaxWidth()) {
+            Text(localized(languageId, "Review words and quiz", "查看词汇与错题"))
+        }
+        OutlinedButton(onClick = onBackToToday, modifier = Modifier.fillMaxWidth()) {
+            Text(localized(languageId, "Go to today's review", "前往今日复习"))
+        }
+        Spacer(Modifier.height(20.dp))
+    }
+}
+
+@Composable
+private fun CompletionResultRow(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(label, modifier = Modifier.weight(1f), color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+    }
+}
+
+@Composable
 private fun RecordingPanel(
     recordingState: RecordingState,
     amplitude: Float,
@@ -3241,11 +3814,13 @@ private fun PrimaryButton(
     text: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    enabled: Boolean = true,
 ) {
     val interaction = remember { MutableInteractionSource() }
     val pressed by interaction.collectIsPressedAsState()
     Button(
         onClick = onClick,
+        enabled = enabled,
         interactionSource = interaction,
         modifier = modifier
             .height(52.dp)
