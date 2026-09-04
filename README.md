@@ -1,63 +1,108 @@
 # 01tts / Listening Lab
 
-Listening Lab 是面向英语听力、阅读、词汇和口语训练的学习项目。仓库同时保留一个轻量的 Edge TTS 文本转语音命令行工具。
+Listening Lab is an open-source English listening, reading, vocabulary, and
+speaking practice project. It includes a Kotlin/Jetpack Compose Android app,
+a Python API and background worker, and a small standalone Edge TTS command
+line tool.
 
-## 项目结构
+## What is included
 
-- `01tts-worker/`：FastAPI 后端与任务 Worker，负责课程生成、TTS、口语转写和评分。
-- `01tts-app/`：Kotlin、Jetpack Compose Android 客户端。
-- `contracts/`：跨端接口契约样例。
-- `main.py`、`src/`、`input/`：独立 Edge TTS 命令行工具。
-- `LISTENING_LAB_PRODUCT_AND_TECHNICAL_DESIGN.md`：当前统一的产品与技术设计文档。
+- `01tts-app/` — Android client with course playback, reading exercises,
+  speaking practice, AnkiDroid integration, TTS provider/voice selection, and
+  update checks.
+- `01tts-worker/` — FastAPI backend and worker for lesson generation, TTS,
+  transcription, scoring, and audio storage.
+- `main.py` and `src/` — independent Edge TTS command-line utility.
+- `contracts/` — cross-component API contract examples.
+- `LISTENING_LAB_PRODUCT_AND_TECHNICAL_DESIGN.md` — consolidated product and
+  technical design.
 
-历史开发计划和阶段性测试报告已合并到统一设计文档或由 Git 历史保存，不再在仓库根目录重复维护。
+## Architecture and security boundary
 
-## 服务地址与模型
-
-- 公网 API：`https://api.zhchoice.xyz/`
-- 文本生成：DeepSeek
-- 默认语音合成：阿里云 CosyVoice；显式声音仍可选择 Edge TTS 或 OpenAI TTS
-- 口语转写与部分口语能力：OpenAI
-
-API Key 只通过本地忽略文件或环境变量配置，不得提交到 Git。
-
-## Android
-
-```bash
-cd 01tts-app
-./gradlew testDebugUnitTest assembleDebug lintDebug
+```text
+Android app --HTTPS--> FastAPI backend --> Redis / AI / TTS providers
+                                      \--> audio storage
 ```
 
-详细开发、签名和在线更新说明见 `01tts-app/README.md`。
+Provider credentials belong on the backend only. The Android app contains a
+public API endpoint, not OpenAI, DeepSeek, or Aliyun credentials. Never put a
+provider key in Gradle properties, `BuildConfig`, resources, assets, or an APK:
+an APK should be assumed to be inspectable by its user.
 
-## 后端
+The repository owner may operate a public demo at `https://api.zhchoice.xyz/`.
+It is an optional demonstration service, not a required dependency or an SLA
+for self-hosted deployments.
+
+## Quick start: standalone Edge TTS
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python main.py --list-voices
+python main.py -f input/sample.txt
+```
+
+Generated audio is written to `output/`, which is ignored by Git.
+
+## Run the backend locally
 
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install -r 01tts-worker/requirements.txt
+cp 01tts-worker/config.example.yaml 01tts-worker/config.yaml
+
+# Use environment variables for real credentials.
+export DEEPSEEK_API_KEY='your-local-key'
+export OPENAI_API_KEY='your-local-key'
+
 cd 01tts-worker
 python -m unittest discover -s tests -v
 python api.py
 ```
 
-生产环境通过 systemd 运行 FastAPI，并由 Nginx 将 `api.zhchoice.xyz` 转发至后端。生产密钥、数据库配置与代理配置均留在服务器环境中。
+`01tts-worker/config.yaml` is intentionally ignored. Environment variables
+take precedence over file values. Redis, provider accounts, and any production
+proxy/TTS service must be configured separately.
 
-## 独立 Edge TTS 工具
+## Build and test the Android app
 
 ```bash
-source venv/bin/activate
-pip install -r requirements.txt
-python main.py -f sample.txt
-python main.py --list-voices
+cd 01tts-app
+JAVA_HOME='/Applications/Android Studio.app/Contents/jbr/Contents/Home' \
+  ./gradlew clean testDebugUnitTest lintDebug assembleDebug
 ```
 
-输入文本位于 `input/`，生成音频位于 `output/`。`output/*.mp3` 属于生成物，不提交 Git。
+The APK is produced at `app/build/outputs/apk/debug/app-debug.apk`. Override
+the backend endpoint at build time when needed:
 
-## 发布前检查
+```bash
+./gradlew assembleDebug -PLISTENING_LAB_API_URL=https://api.example.com/
+```
 
-1. 后端单元测试通过。
-2. Android 单元测试、Lint 和 APK 构建通过。
-3. 确认版本号、HTTPS API 地址、APK 签名与 SHA-256。
-4. 扫描仓库，确认没有 API Key、密码、代理订阅或私钥。
-5. 上传版本化 APK，更新云端 `latest.json`，再验证公网下载和真实业务接口。
+The app uses the backend for provider-backed generation. Do not add provider
+keys to the Android project or create a personal APK containing them.
+
+## Security checks
+
+Run the local scanner before every public push:
+
+```bash
+bash scripts/security-scan.sh
+```
+
+The scanner checks tracked files for common credential formats and forbidden
+credential/config file names. GitHub Actions runs the same check on pushes and
+pull requests. See [SECURITY.md](SECURITY.md) for reporting and deployment
+guidance.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, validation, and pull-request
+guidelines. Please keep credentials, production configuration, generated APKs,
+and generated audio out of commits.
+
+## License
+
+This project is released under the [MIT License](LICENSE).

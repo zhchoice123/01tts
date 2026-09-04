@@ -16,22 +16,14 @@ if [[ -n "$tracked_hits" ]]; then
   status=1
 fi
 
-for forbidden in \
-  .env \
-  .env.* \
-  api-keys.properties \
-  config.yaml \
-  '*.pem' \
-  '*.key' \
-  '*.p12' \
-  '*.jks' \
-  '*.keystore'; do
-  while IFS= read -r path; do
-    [[ -z "$path" ]] && continue
-    echo "Sensitive-looking file is tracked: $path"
-    status=1
-  done < <(git ls-files | rg -N "(^|/)${forbidden//./\\.}$" || true)
-done
+while IFS= read -r path; do
+  case "$path" in
+    .env|.env.*|*/.env|*/.env.*|api-keys.properties|*/api-keys.properties|config.yaml|*/config.yaml|*.pem|*.key|*.p12|*.jks|*.keystore)
+      echo "Sensitive-looking file is tracked: $path"
+      status=1
+      ;;
+  esac
+done < <(git ls-files)
 
 if [[ "$status" -ne 0 ]]; then
   echo "Security scan failed. Revoke exposed credentials before rewriting history."
