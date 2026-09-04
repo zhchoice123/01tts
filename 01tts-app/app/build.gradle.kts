@@ -1,20 +1,6 @@
-import java.util.Properties
-
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.plugin.compose")
-}
-
-val apiKeyProperties = Properties()
-val apiKeyFile = rootProject.file("api-keys.properties")
-if (apiKeyFile.isFile) {
-    apiKeyFile.inputStream().use { input -> apiKeyProperties.load(input) }
-}
-
-fun quotedBuildConfigValue(name: String): String {
-    val raw = apiKeyProperties.getProperty(name, "")
-    val escaped = raw.replace("\\", "\\\\").replace("\"", "\\\"")
-    return "\"$escaped\""
 }
 
 android {
@@ -33,8 +19,6 @@ android {
             "API_BASE_URL",
             "\"${providers.gradleProperty("LISTENING_LAB_API_URL").getOrElse("https://api.zhchoice.xyz/")}\"",
         )
-        buildConfigField("String", "DEEPSEEK_API_KEY", quotedBuildConfigValue("DEEPSEEK_API_KEY"))
-        buildConfigField("String", "OPENAI_API_KEY", quotedBuildConfigValue("OPENAI_API_KEY"))
     }
 
     buildFeatures {

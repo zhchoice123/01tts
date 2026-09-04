@@ -195,19 +195,16 @@ Android / Jetpack Compose
 ├── ViewModel + UseCase
 ├── Room: 学习记录、生词、错题、计划、配置
 ├── DataStore: 非敏感设置
-├── Android Keystore: Provider Key 加密密钥
 ├── WorkManager: 每日同步与通知
 ├── Media3: 音频播放
 ├── MediaRecorder: 录音与真实振幅
-└── Retrofit/OkHttp
-    ├── Direct AI Providers
-    └── Spring Boot API
+└── Retrofit/OkHttp: 仅访问自有后端 API
 
 Spring Boot
 ├── 内容、任务、计划、学习记录 API
 ├── Redis Publisher
 ├── 音频文件访问
-└── 可选 AI Proxy / Streaming Endpoint
+└── AI Provider Proxy / Streaming Endpoint
 
 Python Worker
 ├── 新闻和网页正文提取

@@ -2,6 +2,10 @@ redis:
   url: redis://127.0.0.1:6379/0
   password: replace-with-your-redis-password
 
+# Keep provider credentials in environment variables for normal deployments.
+# DEEPSEEK_API_KEY and OPENAI_API_KEY are intentionally not stored in this
+# example file or in the Android application.
+
 server:
   url: http://127.0.0.1:8080
 

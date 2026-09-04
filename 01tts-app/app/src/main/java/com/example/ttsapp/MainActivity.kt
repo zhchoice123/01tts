@@ -136,8 +136,6 @@ import com.example.ttsapp.review.DailyReviewQueueSection
 import com.example.ttsapp.review.LessonReviewReportCard
 import com.example.ttsapp.review.ReviewQueueItem
 import com.example.ttsapp.core.notifications.DailyLearningScheduler
-import com.example.ttsapp.core.ai.ProviderKind
-import com.example.ttsapp.core.ai.ProviderRegistry
 import com.example.ttsapp.network.LookupVocabularyResponse
 import com.example.ttsapp.network.SpeakingSessionResponse
 import com.example.ttsapp.network.SpeakingTurnDetail
@@ -1349,13 +1347,6 @@ private fun SettingsHub(
 ) {
     val selectedThemeId = state.selectedThemeId
     val selectedLanguageId = state.selectedLanguageId
-    val providers = listOf(
-        Triple(ProviderKind.DEEPSEEK, "DeepSeek", BuildConfig.DEEPSEEK_API_KEY.isNotBlank()),
-        Triple(ProviderKind.OPENAI, "OpenAI", BuildConfig.OPENAI_API_KEY.isNotBlank()),
-    )
-    val scope = rememberCoroutineScope()
-    val testing = remember { mutableStateMapOf<ProviderKind, Boolean>() }
-    val results = remember { mutableStateMapOf<ProviderKind, String>() }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(20.dp),
@@ -1613,56 +1604,6 @@ private fun SettingsHub(
                     }
                 }
             }
-        }
-        item {
-            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
-            Text("AI Providers Configuration", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-        }
-        items(providers, key = { it.first.name }) { (kind, name, configured) ->
-            Surface(color = MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(14.dp)) {
-                Column(
-                    Modifier.fillMaxWidth().padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(name, fontWeight = FontWeight.SemiBold)
-                        }
-                        Text(
-                            if (configured) "Configured" else "Missing",
-                            color = if (configured) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                        )
-                    }
-                    results[kind]?.let { result ->
-                        Text(
-                            result,
-                            color = if (result == "Connection successful") MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                            style = MaterialTheme.typography.bodyMedium,
-                        )
-                    }
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                testing[kind] = true
-                                val health = ProviderRegistry.create(kind).testConnection()
-                                results[kind] = health.message
-                                testing[kind] = false
-                            }
-                        },
-                        enabled = configured && testing[kind] != true,
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text(if (testing[kind] == true) "Testing…" else "Test connection")
-                    }
-                }
-            }
-        }
-        item {
-            Text(
-                "Keys are never shown on screen or written to logs. Re-run scripts/generate-api-keys.sh before packaging when they change.",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                style = MaterialTheme.typography.bodyMedium,
-            )
         }
     }
 }

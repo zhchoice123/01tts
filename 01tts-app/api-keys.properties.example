@@ -1,4 +1,0 @@
-# Copy to api-keys.properties or run scripts/generate-api-keys.sh.
-# The real file is ignored by Git and embedded only in your personal APK.
-DEEPSEEK_API_KEY=
-OPENAI_API_KEY=
