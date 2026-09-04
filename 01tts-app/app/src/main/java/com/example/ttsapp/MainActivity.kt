@@ -199,8 +199,13 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+    private val notificationsEnabled = mutableStateOf(false)
+
     private val notificationPermissionLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            notificationsEnabled.value = granted
+            if (granted) DailyLearningScheduler.schedule(applicationContext)
+        }
 
     private var pendingUpdateApk: File? = null
     private val installPermissionLauncher =
@@ -217,12 +222,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        DailyLearningScheduler.schedule(applicationContext)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+        notificationsEnabled.value = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
-        ) {
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        if (notificationsEnabled.value) {
+            DailyLearningScheduler.schedule(applicationContext)
         }
         setContent {
             val model: MainViewModel = viewModel {
@@ -260,8 +264,26 @@ class MainActivity : ComponentActivity() {
                     },
                     onCancelRecording = ::cancelRecording,
                     onInstallUpdate = ::requestUpdateInstallation,
+                    notificationsEnabled = notificationsEnabled.value,
+                    onEnableNotifications = ::requestNotificationPermission,
                 )
             }
+        }
+    }
+
+    private fun requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            notificationsEnabled.value = true
+            DailyLearningScheduler.schedule(applicationContext)
+            return
+        }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notificationsEnabled.value = true
+            DailyLearningScheduler.schedule(applicationContext)
+        } else {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 
@@ -389,6 +411,8 @@ private fun ListeningApp(
     onRecordCoach: (Int) -> Unit = {},
     onCancelRecording: () -> Unit,
     onInstallUpdate: (File) -> Unit,
+    notificationsEnabled: Boolean,
+    onEnableNotifications: () -> Unit,
 ) {
     val state by model.state.collectAsStateWithLifecycle()
     var historyVisible by remember { mutableStateOf(false) }
@@ -691,6 +715,8 @@ private fun ListeningApp(
                 onCheckForUpdate = ::checkForUpdate,
                 onDownloadUpdate = ::downloadUpdate,
                 onInstallUpdate = onInstallUpdate,
+                notificationsEnabled = notificationsEnabled,
+                onEnableNotifications = onEnableNotifications,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -1343,10 +1369,20 @@ private fun SettingsHub(
     onCheckForUpdate: () -> Unit,
     onDownloadUpdate: (com.example.ttsapp.network.AppReleaseResponse) -> Unit,
     onInstallUpdate: (File) -> Unit,
+    notificationsEnabled: Boolean,
+    onEnableNotifications: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val selectedThemeId = state.selectedThemeId
     val selectedLanguageId = state.selectedLanguageId
+    var legalDocument by rememberSaveable { mutableStateOf<LegalDocument?>(null) }
+    legalDocument?.let { document ->
+        LegalDocumentSheet(
+            document = document,
+            languageId = selectedLanguageId,
+            onDismiss = { legalDocument = null },
+        )
+    }
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(20.dp),
@@ -1481,6 +1517,58 @@ private fun SettingsHub(
             }
         }
         item {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    localized(selectedLanguageId, "Learning reminders", "学习提醒"),
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    localized(
+                        selectedLanguageId,
+                        "Enable notifications when you want a daily study reminder. Listening Lab never asks on first launch.",
+                        "需要每日学习提醒时再开启通知。Listening Lab 不会在首次启动时直接索取通知权限。",
+                    ),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(
+                    onClick = onEnableNotifications,
+                    enabled = !notificationsEnabled,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        if (notificationsEnabled) {
+                            localized(selectedLanguageId, "Daily reminders enabled", "每日提醒已开启")
+                        } else {
+                            localized(selectedLanguageId, "Enable daily reminders", "开启每日提醒")
+                        }
+                    )
+                }
+            }
+        }
+        item {
+            HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+            Text(
+                localized(selectedLanguageId, "Privacy and legal", "隐私与协议"),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { legalDocument = LegalDocument.PRIVACY },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(localized(selectedLanguageId, "Privacy notice", "隐私说明"))
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { legalDocument = LegalDocument.TERMS },
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(localized(selectedLanguageId, "Terms of use", "使用条款"))
+            }
+        }
+        item {
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
             Text(
                 localized(selectedLanguageId, "App updates", "应用更新"),
@@ -1604,6 +1692,52 @@ private fun SettingsHub(
                     }
                 }
             }
+        }
+    }
+}
+
+private enum class LegalDocument { PRIVACY, TERMS }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LegalDocumentSheet(
+    document: LegalDocument,
+    languageId: String,
+    onDismiss: () -> Unit,
+) {
+    val isPrivacy = document == LegalDocument.PRIVACY
+    val title = if (isPrivacy) {
+        localized(languageId, "Privacy notice", "隐私说明")
+    } else {
+        localized(languageId, "Terms of use", "使用条款")
+    }
+    val body = if (isPrivacy) {
+        localized(
+            languageId,
+            "Listening Lab sends lesson topics, learning progress, vocabulary requests, and recordings you choose to submit to the project backend for course generation and speaking feedback. Recordings are requested only when you start a speaking exercise. The Android app does not contain third-party AI credentials and does not send requests directly to AI providers. Do not submit confidential material. Before a production launch, the operator will publish the retention period and a verified data-deletion channel.",
+            "Listening Lab 会将课程主题、学习进度、查词请求，以及你主动提交的录音发送到项目后端，用于生成课程和口语反馈。只有当你开始口语练习时才会请求录音权限。Android 应用不包含第三方 AI 密钥，也不会直接请求 AI 服务商。请勿提交机密资料。正式发布前，运营方将进一步公布数据保存期限和经过验证的数据删除渠道。",
+        )
+    } else {
+        localized(
+            languageId,
+            "Listening Lab is currently a public beta for technical-English learning. AI-generated lessons, transcripts, scores, and suggestions may contain errors and should not be treated as professional advice. You are responsible for material you submit and must have the right to use it. Service availability and generation speed are not guaranteed during the beta. Continued use means you accept these beta limitations.",
+            "Listening Lab 当前是面向技术英语学习的公开测试版本。AI 生成的课程、转写、评分和建议可能存在错误，不应作为专业意见。你需要确保有权使用自己提交的资料。测试期间不保证服务持续可用或固定的生成速度。继续使用即表示你理解并接受这些测试版限制。",
+        )
+    }
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp, vertical = 12.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
+            Text(body, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Button(onClick = onDismiss, modifier = Modifier.fillMaxWidth()) {
+                Text(localized(languageId, "I understand", "我已了解"))
+            }
+            Spacer(Modifier.height(24.dp))
         }
     }
 }
