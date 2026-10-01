@@ -37,6 +37,13 @@ ALIYUN_VOICES = {
     "loongeric_v2": "Eric · British male",
     "loongemily_v2": "Emily · British female",
 }
+# Legacy Edge voice names keep their accent and gender on Aliyun.
+EDGE_TO_ALIYUN_VOICES = {
+    "en-US-AvaNeural": "loongabby_v2",
+    "en-US-AndrewNeural": "loongdavid_v2",
+    "en-GB-SoniaNeural": "loongemily_v2",
+    "en-GB-RyanNeural": "loongeric_v2",
+}
 ALIYUN_TTS_BASE_URL = os.getenv("ALIYUN_TTS_BASE_URL", "http://127.0.0.1:8088").rstrip("/")
 
 
@@ -89,11 +96,7 @@ def _tts_provider_voice(requested_voice: str) -> tuple[str, str]:
     if provider == "aliyun":
         if value in ALIYUN_VOICES:
             return provider, value
-        mapped = {
-            "en-US-AvaNeural": "loongdavid_v2",
-            "en-US-AndrewNeural": "loongabby_v2",
-            "en-GB-SoniaNeural": "loongeric_v2",
-        }.get(value)
+        mapped = EDGE_TO_ALIYUN_VOICES.get(value)
         if mapped:
             return provider, mapped
         if not value:

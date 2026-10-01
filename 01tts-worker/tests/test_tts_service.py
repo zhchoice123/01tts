@@ -23,14 +23,21 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
 
     @patch.dict("os.environ", {}, clear=True)
     def test_unprefixed_voice_defaults_to_aliyun(self):
-        self.assertEqual(
-            ("aliyun", "loongdavid_v2"),
-            _tts_provider_voice("en-US-AvaNeural"),
-        )
-        self.assertEqual(
-            ("aliyun", "loongabby_v2"),
-            _tts_provider_voice("en-US-AndrewNeural"),
-        )
+        self.assertEqual(("aliyun", "loongdavid_v2"), _tts_provider_voice(""))
+
+    @patch.dict("os.environ", {}, clear=True)
+    def test_legacy_voices_keep_gender_and_accent_on_aliyun(self):
+        # Regression: Ava and Andrew used to swap genders, so dialogue HOST and
+        # EXPERT were voiced opposite to their configured voices.
+        expected = {
+            "en-US-AvaNeural": "loongabby_v2",
+            "en-US-AndrewNeural": "loongdavid_v2",
+            "en-GB-SoniaNeural": "loongemily_v2",
+            "en-GB-RyanNeural": "loongeric_v2",
+        }
+        for legacy, aliyun in expected.items():
+            with self.subTest(legacy=legacy):
+                self.assertEqual(("aliyun", aliyun), _tts_provider_voice(legacy))
 
     @patch("src.tts_service._transcribe_word_timings")
     @patch("src.tts_service._synthesize_text")
@@ -230,6 +237,6 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             _tts_provider_voice("openai:garbage:nova")
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(
-                ("aliyun", "loongabby_v2"),
+                ("aliyun", "loongdavid_v2"),
                 _tts_provider_voice("en-US-AndrewNeural"),
             )
