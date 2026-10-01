@@ -265,6 +265,91 @@ class DeepSeekServiceTest(unittest.TestCase):
         self.assertNotIn("exactly 16", refinement_prompt)
 
 
+    @staticmethod
+    def _complete_script(word_count, dialogue=False):
+        lesson = {
+            "title": "Investigating duplicate scheduled jobs",
+            "level": "B1",
+            "passage": " ".join(["backend"] * word_count),
+            "simplifiedPassage": "Investigate duplicate jobs across replicas.",
+            "vocabulary": [
+                {"word": f"term{i}", "definition": "technical term"}
+                for i in range(10 if dialogue else 12)
+            ],
+            "questions": [
+                {"prompt": f"Question {i}", "options": ["A"], "answer": "A"}
+                for i in range(5)
+            ],
+            "speakingPrompts": ["Describe the evidence.", "Explain recovery."],
+            "writingPrompts": ["Write a runbook."],
+        }
+        if dialogue:
+            per_turn, remainder = divmod(word_count, 16)
+            lesson["dialogue"] = [
+                {
+                    "speaker": "HOST" if index % 2 == 0 else "EXPERT",
+                    "text": " ".join(
+                        ["backend"] * (per_turn + (index < remainder))
+                    ),
+                }
+                for index in range(16)
+            ]
+        return lesson
+
+    def test_dialogue_above_old_word_cap_needs_no_refinement(self):
+        service = DeepSeekService(api_key="test-key")
+        for word_count in (1302, 2000):
+            with self.subTest(word_count=word_count):
+                draft = self._complete_script(word_count, dialogue=True)
+                with patch.object(
+                    service, "_generate_dialogue_json", return_value=draft
+                ) as generate:
+                    lesson = service.generate_dialogue_lesson("Investigate jobs")
+                generate.assert_called_once()
+                self.assertEqual(word_count, lesson["wordCount"])
+                self.assertEqual(
+                    round(word_count / 125 * 60),
+                    lesson["estimatedDurationSeconds"],
+                )
+
+    def test_long_passage_above_old_word_caps_needs_no_refinement(self):
+        service = DeepSeekService(api_key="test-key")
+        for word_count in (1451, 1600, 2000):
+            with self.subTest(word_count=word_count):
+                draft = self._complete_script(word_count)
+                with patch.object(
+                    service, "_generate_with_prompt", return_value=draft
+                ) as generate:
+                    lesson = service.generate_long_lesson("Investigate jobs")
+                generate.assert_called_once()
+                self.assertEqual(word_count, lesson["wordCount"])
+                self.assertEqual(
+                    round(word_count / 130 * 60),
+                    lesson["estimatedDurationSeconds"],
+                )
+
+    def test_minimum_script_lengths_still_apply(self):
+        for dialogue, minimum in ((True, 700), (False, 1200)):
+            validator = (
+                DeepSeekService._dialogue_lesson_issues
+                if dialogue else DeepSeekService._long_lesson_issues
+            )
+            with self.subTest(dialogue=dialogue):
+                issues = validator(self._complete_script(minimum - 1, dialogue))
+                self.assertEqual(1, len(issues))
+                self.assertIn(f"minimum is {minimum}", issues[0])
+                self.assertEqual(
+                    [], validator(self._complete_script(minimum, dialogue))
+                )
+
+    def test_long_dialogue_still_requires_valid_structure(self):
+        draft = self._complete_script(1302, dialogue=True)
+        draft["dialogue"][0]["speaker"] = "EXPERT"
+        draft["questions"] = []
+        issues = DeepSeekService._dialogue_lesson_issues(draft)
+        self.assertTrue(any("expected HOST" in issue for issue in issues))
+        self.assertIn("questions has 0 items", issues)
+
     def test_scripts_are_written_for_listening(self):
         from src.deepseek_service import (
             DIALOGUE_LESSON_SYSTEM_PROMPT,

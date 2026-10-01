@@ -489,6 +489,59 @@ class BackendApiTest(unittest.TestCase):
             self.client.get(completed["audioUrl"]).content,
         )
 
+    def test_scripts_above_old_word_caps_reach_audio_and_ready(self):
+        for dialogue, word_count in ((True, 1302), (False, 1600)):
+            with self.subTest(dialogue=dialogue):
+                method = (
+                    "generate_dialogue_lesson" if dialogue else "generate_long_lesson"
+                )
+                draft = getattr(self.service.generator, method)("Investigate jobs")
+                if dialogue:
+                    per_turn, remainder = divmod(word_count, len(draft["dialogue"]))
+                    for index, turn in enumerate(draft["dialogue"]):
+                        turn["text"] = " ".join(
+                            ["backend"] * (per_turn + (index < remainder))
+                        )
+                    draft["passage"] = "\n\n".join(
+                        f"{turn['speaker'].title()}: {turn['text']}"
+                        for turn in draft["dialogue"]
+                    )
+                else:
+                    draft["passage"] = " ".join(["backend"] * word_count)
+
+                response = self.client.post(
+                    "/api/v1/dialogue-lessons" if dialogue else "/api/v1/long-lessons",
+                    json={
+                        "topic": "Investigating duplicate scheduled jobs in a custom case",
+                        "category": "SPRING",
+                        "sourceMode": "AI",
+                    },
+                )
+                self.assertEqual(202, response.status_code)
+                content_uuid = response.json()["uuid"]
+                audio_attribute = (
+                    "dialogue_audio_generator" if dialogue else "audio_generator"
+                )
+                audio_generator = getattr(self.service, audio_attribute)
+                with patch.object(
+                    self.service.generator, method, return_value=draft
+                ), patch.object(
+                    self.service, audio_attribute, wraps=audio_generator
+                ) as synthesize:
+                    self.service.process_lesson(content_uuid)
+                synthesize.assert_awaited_once()
+
+                completed = self.client.get(
+                    f"/api/v1/content/{content_uuid}"
+                ).json()
+                self.assertEqual("READY", completed["status"])
+                lesson = json.loads(completed["lessonContent"])
+                self.assertGreaterEqual(lesson["wordCount"], word_count)
+                self.assertTrue(completed["audioUrl"].endswith(".mp3"))
+                self.assertEqual(
+                    200, self.client.get(completed["audioUrl"]).status_code
+                )
+
     def test_learning_progress_upsert_and_read(self):
         client_id = str(uuid.uuid4())
         content_uuid = str(uuid.uuid4())
