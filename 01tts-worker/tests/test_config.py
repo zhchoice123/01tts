@@ -9,6 +9,20 @@ from src.config import load_config
 
 
 class WorkerConfigTest(unittest.TestCase):
+    def test_moonshot_cloud_config_keeps_environment_precedence_and_masks_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yaml"
+            path.write_text("moonshot:\n  model: kimi-file\n  api_key: file-key\n")
+            with patch.dict(os.environ, {}, clear=True):
+                config = load_config(path)
+            self.assertEqual("kimi-file", config.moonshot_model)
+            self.assertEqual("file-key", config.moonshot_api_key)
+            with patch.dict(os.environ, {"MOONSHOT_MODEL": "kimi-k3", "MOONSHOT_API_KEY": "test-moonshot-secret"}, clear=True):
+                config = load_config(path)
+            self.assertEqual("kimi-k3", config.moonshot_model)
+            self.assertEqual("test-moonshot-secret", config.moonshot_api_key)
+            self.assertNotIn("test-moonshot-secret", repr(config))
+
     def test_loads_yaml_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.yaml"
