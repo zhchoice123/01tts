@@ -36,7 +36,7 @@ from src.backend_models import (
     utc_now,
 )
 from src.content_ingestion import fetch_content, fetch_feed_candidates
-from src.content_diversity import BackendTopic, TOPIC_CATALOG, duplicate_passage
+from src.content_diversity import BackendTopic, TOPIC_CATALOG, coverage_digest, duplicate_passage
 from src.deepseek_service import DeepSeekService, count_english_words
 from src.lesson_review import generate_lesson_review_report
 from src.provider_router import ProviderRouter
@@ -49,6 +49,8 @@ LOGGER = logging.getLogger("tts-python-api.service")
 
 
 LONG_LESSON_PREFIX = "__LISTENING_LAB_LONG_V1__:"
+# Recent lesson summaries shown to the generator as material to avoid.
+COVERAGE_PROMPT_LIMIT = 20
 
 class BackendService:
     def __init__(
@@ -1113,7 +1115,8 @@ class BackendService:
                 return selected
         raise ValueError("No unused backend problems available within the topic cooldown")
 
-    def novelty_history(self, record_uuid: str) -> list[tuple[str, str]]:
+    def novelty_history(self, record_uuid: str) -> list[tuple[str, str, str]]:
+        """Return (uuid, passage, coverage digest) for recent non-news lessons."""
         with self.session_factory() as session:
             records = session.execute(
                 select(ContentRecord.uuid, ContentRecord.lesson_content)
@@ -1133,7 +1136,7 @@ class BackendService:
                 continue
             passage = str(lesson.get("passage") or "")
             if passage and not passage.startswith("Audio-only lesson"):
-                history.append((content_uuid, passage))
+                history.append((content_uuid, passage, coverage_digest(lesson)))
         return history
 
     def ensure_daily_generation(self) -> dict[str, Any] | None:
@@ -1300,9 +1303,13 @@ class BackendService:
             history = self.novelty_history(record_uuid) if automatic_lesson else []
             if history:
                 prompt += (
-                    "\nPreviously covered material follows. Do not repeat its explanation; "
-                    "keep the requested problem and add new evidence and decisions:\n"
-                    + "\n".join(previous[:220] for _, previous in history[:30])
+                    "\nLessons already published (title, recap, key terms). Keep the "
+                    "requested problem, but do not reuse their scenario, example, analogy, "
+                    "or order of explanation; choose a different hypothetical case and "
+                    "different evidence:\n"
+                    + "\n".join(
+                        f"- {digest}" for _, _, digest in history[:COVERAGE_PROMPT_LIMIT]
+                    )
                 )
             metadata = {
                 "uuid": record_uuid,
@@ -1358,7 +1365,9 @@ class BackendService:
             )
             if automatic_lesson:
                 failure_stage = "CONTENT_NOVELTY"
-                duplicate_uuid = duplicate_passage(str(passage), history)
+                duplicate_uuid = duplicate_passage(
+                    str(passage), [(content_uuid, previous) for content_uuid, previous, _ in history]
+                )
                 if duplicate_uuid:
                     raise ValueError(f"Generated passage repeats existing content {duplicate_uuid}; audio was not generated")
             destination = (
