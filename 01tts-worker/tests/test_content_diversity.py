@@ -6,7 +6,7 @@ from unittest.mock import patch
 from sqlalchemy import select
 from src.backend_models import ContentArchiveRecord, ContentRecord, TopicCandidateRecord, DailyPlanRecord
 from src.content_archive import archive_reviewed, lesson_digest, restore_archive
-from src.content_diversity import TOPIC_CATALOG, duplicate_passage
+from src.content_diversity import TOPIC_CATALOG, coverage_digest, duplicate_passage
 from tests import test_backend_api
 
 
@@ -111,6 +111,48 @@ class ContentDiversityTest(unittest.TestCase):
         content = self.service.get_content(topic["contentUuid"])
         self.assertEqual("FAILED", content["status"])
         self.assertIn("CONTENT_NOVELTY", content["failureReason"])
+
+    def test_coverage_digest_summarizes_title_recap_and_terms(self):
+        digest = coverage_digest({
+            "title": "Pool exhaustion",
+            "simplifiedPassage": "A slow query held every connection. " * 20,
+            "vocabulary": [{"word": "pool"}, {"word": "timeout"}],
+        })
+        self.assertTrue(digest.startswith("Pool exhaustion: A slow query held every connection."))
+        self.assertLess(len(digest), 320)
+        self.assertTrue(digest.endswith("Key terms: pool, timeout."))
+        dialogue = coverage_digest({"title": "Talk", "passage": "Host: Why retry?\n\nExpert: Because."})
+        self.assertEqual("Talk: Why retry? Because.", dialogue)
+
+    def test_prompt_lists_covered_lessons_instead_of_passage_openings(self):
+        # Regression: the prompt used the first 220 characters of each passage,
+        # which were mostly greetings and did not describe what was covered.
+        with self.sessions() as session:
+            session.add(ContentRecord(
+                uuid="covered", title="Pool exhaustion", source_type="TEXT",
+                source_text="Pool exhaustion", level="B1", status="READY",
+                lesson_content=json.dumps({
+                    "title": "Pool exhaustion under a slow report query",
+                    "passage": "Host: Welcome back to the show, everyone.",
+                    "simplifiedPassage": "A reporting query held all twenty connections.",
+                    "vocabulary": [{"word": "saturation"}],
+                }),
+            ))
+            session.commit()
+        item = next(item for item in TOPIC_CATALOG if item.angle == "Diagnosis")
+        response = self.fixture.client.post("/api/v1/dialogue-lessons", json={
+            "topic": item.title, "category": item.category, "sourceMode": "AI",
+        }).json()
+        original = self.service.generator.generate_dialogue_lesson
+        with patch.object(self.service.generator, "generate_dialogue_lesson", wraps=original) as generate:
+            self.service.process_lesson(response["uuid"])
+            prompt = generate.call_args.kwargs["prompt"]
+        self.assertIn(
+            "- Pool exhaustion under a slow report query: A reporting query held all "
+            "twenty connections. Key terms: saturation.",
+            prompt,
+        )
+        self.assertNotIn("Welcome back to the show", prompt)
 
     def test_catalog_supports_four_daily_reservations_for_seventy_days(self):
         start = date(2026, 7, 1)

@@ -141,3 +141,21 @@ def duplicate_passage(passage: str, history: list[tuple[str, str]], threshold: f
         if overlap_score(signature, passage_signature(previous)) >= threshold:
             return content_uuid
     return None
+
+
+def coverage_digest(lesson: dict, max_recap_chars: int = 240) -> str:
+    """Summarize what a lesson covered so the generator can avoid repeating it."""
+    title = " ".join(str(lesson.get("title") or "Untitled lesson").split())
+    recap = str(lesson.get("simplifiedPassage") or "")
+    if not recap.strip():
+        recap = re.sub(r"^(Host|Expert):\s*", "", str(lesson.get("passage") or ""), flags=re.MULTILINE)
+    recap = " ".join(recap.split())
+    if len(recap) > max_recap_chars:
+        recap = recap[:max_recap_chars].rsplit(" ", 1)[0] + "..."
+    terms = [
+        str(item.get("word")).strip()
+        for item in (lesson.get("vocabulary") or [])[:6]
+        if isinstance(item, dict) and str(item.get("word") or "").strip()
+    ]
+    digest = f"{title}: {recap}" if recap else title
+    return digest + (f" Key terms: {', '.join(terms)}." if terms else "")
