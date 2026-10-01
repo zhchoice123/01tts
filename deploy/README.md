@@ -22,7 +22,7 @@ GitHub 拉取代码，不再从个人电脑接收打包文件。Android APK 和�
 尚未执行。隔离验证目录为 `/opt/01tts/backups/git-deploy-check-20261001`。
 
 本次源码整合将上述后端功能、部署脚本、已提交的语音映射修复和
-`CLAUDE.md` 纳入 `main`，并补齐云端 Kimi 参数和 Moonshot 配置兼容。
+`CLAUDE.md` 纳入 `main`。Kimi/Moonshot 兼容随后移除，生成器只调用 DeepSeek。
 本次只同步 GitHub 源码，不执行云端拉取或重启。生产目录尚未切换到
 Git 部署，不能据此将线上运行版本认定为最新 `main`。
 

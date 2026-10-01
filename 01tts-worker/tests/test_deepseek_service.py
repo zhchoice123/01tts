@@ -6,34 +6,6 @@ from src.deepseek_service import DeepSeekService, count_english_words, parse_mod
 
 
 class DeepSeekServiceTest(unittest.TestCase):
-    @patch("src.deepseek_service.requests.post")
-    def test_kimi_cloud_temperature_is_preserved_for_all_lesson_formats(self, post):
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"choices": [{"message": {"content": '{"dialogue": []}'}}]}
-        post.return_value = response
-        service = DeepSeekService(api_key="test-key", model="kimi-k3")
-        service._generate_dialogue_json("test", max_tokens=1000, max_retries=1)
-        self.assertEqual(1.0, post.call_args.kwargs["json"]["temperature"])
-        self.assertNotIn("thinking", post.call_args.kwargs["json"])
-        with patch("src.deepseek_service.validate_and_repair_lesson_content", return_value={}):
-            service._generate_with_prompt("test", "system", {}, max_tokens=1000, max_retries=1)
-            self.assertEqual(1.0, post.call_args.kwargs["json"]["temperature"])
-            service.generate_lesson("test", max_retries=1)
-        self.assertEqual(1.0, post.call_args.kwargs["json"]["temperature"])
-
-    @patch("src.deepseek_service.requests.post")
-    def test_kimi_dialogue_keeps_cloud_retry_limit(self, post):
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"choices": [{"message": {"content": "invalid"}}]}
-        post.return_value = response
-        with self.assertRaises(RuntimeError):
-            DeepSeekService(api_key="test-key", model="kimi-k3")._generate_dialogue_json(
-                "test", max_tokens=1000, max_retries=1
-            )
-        self.assertEqual(1, post.call_count)
-
     def test_count_english_words_handles_hyphenated_terms(self):
         self.assertEqual(5, count_english_words("A cloud-native service isn't fragile."))
 
