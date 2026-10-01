@@ -49,6 +49,8 @@ LOGGER = logging.getLogger("tts-python-api.service")
 
 
 LONG_LESSON_PREFIX = "__LISTENING_LAB_LONG_V1__:"
+# Imported text that is read aloud as written, without generator rewriting.
+VERBATIM_TEXT_PREFIX = "__LISTENING_LAB_VERBATIM_V1__:"
 # Recent lesson summaries shown to the generator as material to avoid.
 COVERAGE_PROMPT_LIMIT = 20
 
@@ -606,6 +608,7 @@ class BackendService:
         text: str,
         title: str,
         level: str,
+        verbatim: bool = False,
     ) -> dict[str, Any]:
         normalized_type = source_type.strip().upper()
         if normalized_type not in {"TEXT", "URL", "NEWS", "TECH_DOC"}:
@@ -614,6 +617,8 @@ class BackendService:
         source_url = source_url.strip()
         if normalized_type == "TEXT" and not source_text:
             raise ValueError("text is required for TEXT content")
+        if verbatim and normalized_type != "TEXT":
+            raise ValueError("verbatim is only supported for TEXT content")
         if normalized_type != "TEXT" and not source_url and not source_text:
             raise ValueError("sourceUrl or text is required")
         resolved_text = source_text or source_url
@@ -622,7 +627,7 @@ class BackendService:
             title=title.strip() or resolved_text[:60] or "English learning content",
             source_type=normalized_type,
             source_url=source_url or None,
-            source_text=resolved_text,
+            source_text=(VERBATIM_TEXT_PREFIX if verbatim else "") + resolved_text,
             level=level or "B1",
             status="GENERATING",
         )
@@ -738,6 +743,12 @@ class BackendService:
             return parsed if isinstance(parsed, dict) else None
         except json.JSONDecodeError:
             return None
+
+    @staticmethod
+    def _verbatim_text(source_text: str) -> str | None:
+        if not source_text.startswith(VERBATIM_TEXT_PREFIX):
+            return None
+        return source_text[len(VERBATIM_TEXT_PREFIX):]
 
     def get_content(self, content_uuid: str) -> dict[str, Any] | None:
         with self.session_factory() as session:
@@ -1230,8 +1241,11 @@ class BackendService:
                 )
                 return
             source_type = content.source_type if content else "TEXT"
+            verbatim_text = self._verbatim_text(content.source_text) if content else None
             source_input = (
-                (content.source_url or content.source_text) if content else task.prompt
+                (content.source_url or verbatim_text or content.source_text)
+                if content
+                else task.prompt
             )
             difficulty = content.level if content else task.difficulty
             voice = "en-US-AvaNeural" if content else task.voice
@@ -1320,7 +1334,21 @@ class BackendService:
                 "passage": ingested.passage,
             }
             failure_stage = "SCRIPT_GENERATION"
-            if long_metadata:
+            if verbatim_text is not None:
+                # Read the learner's own script as written; no generator call.
+                lesson = validate_and_repair_lesson_content(
+                    {
+                        "passage": verbatim_text,
+                        "simplifiedPassage": "",
+                        "audioUrl": "",
+                        "vocabulary": [],
+                        "questions": [],
+                        "speakingPrompts": [],
+                        "writingPrompts": [],
+                    },
+                    metadata=metadata,
+                )
+            elif long_metadata:
                 is_dialogue = long_metadata.get("format") == "DIALOGUE"
                 generator_method = (
                     "generate_dialogue_lesson"
@@ -1741,17 +1769,18 @@ class BackendService:
     @classmethod
     def content_dict(cls, content: ContentRecord) -> dict[str, Any]:
         long_metadata = cls._long_lesson_metadata(content.source_text)
+        source_text = (
+            str(long_metadata.get("topic", ""))
+            if long_metadata
+            else cls._verbatim_text(content.source_text) or content.source_text
+        )
         result = {
             "uuid": content.uuid,
             "title": content.title,
             "sourceType": content.source_type,
             "sourceUrl": content.source_url,
-            "sourceText": (
-                str(long_metadata.get("topic", "")) if long_metadata else content.source_text
-            ),
-            "prompt": (
-                str(long_metadata.get("topic", "")) if long_metadata else content.source_text
-            ),
+            "sourceText": source_text,
+            "prompt": source_text,
             "level": content.level,
             "status": content.status,
             "audioUrl": content.audio_url,

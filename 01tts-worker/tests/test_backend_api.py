@@ -1215,6 +1215,60 @@ class BackendApiTest(unittest.TestCase):
             any(topic["kind"] == "SOURCE_ARTICLE" for topic in visible_topics)
         )
 
+    def test_verbatim_text_import_reads_script_without_generator(self):
+        script = (
+            "Java Concurrency, topic one.\n\n"
+            "AQS keeps one volatile integer called state."
+        )
+        created = self.client.post(
+            "/api/v1/content/import",
+            json={
+                "sourceType": "TEXT",
+                "text": script,
+                "title": "AQS Core",
+                "level": "B2",
+                "verbatim": True,
+            },
+        ).json()
+        self.assertEqual(script, created["sourceText"])
+
+        spoken = []
+
+        async def recording_audio_generator(text, output_path, voice, **kwargs):
+            spoken.append((text, voice))
+            return await fake_audio_generator(text, output_path, voice, **kwargs)
+
+        with (
+            patch.object(
+                self.service.generator,
+                "generate_lesson",
+                side_effect=AssertionError("generator must not run"),
+            ),
+            patch.object(self.service, "audio_generator", recording_audio_generator),
+        ):
+            self.service.process_lesson(created["uuid"])
+
+        completed = self.client.get(f"/api/v1/content/{created['uuid']}").json()
+        self.assertEqual("READY", completed["status"])
+        self.assertEqual("AQS Core", completed["title"])
+        self.assertEqual(script, completed["sourceText"])
+        self.assertEqual([(script, "en-US-AvaNeural")], spoken)
+        lesson = json.loads(completed["lessonContent"])
+        self.assertEqual(script, lesson["passage"])
+        self.assertEqual([], lesson["questions"])
+        self.assertEqual(1, len(lesson["wordTimings"]))
+
+    def test_verbatim_import_requires_text_source(self):
+        response = self.client.post(
+            "/api/v1/content/import",
+            json={
+                "sourceType": "URL",
+                "sourceUrl": "https://example.com/post",
+                "verbatim": True,
+            },
+        )
+        self.assertEqual(400, response.status_code)
+
     def test_legacy_completion_routes_remain_compatible(self):
         content = self.client.post(
             "/api/v1/content/import",
