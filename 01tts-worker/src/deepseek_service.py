@@ -272,7 +272,7 @@ class DeepSeekService:
 
     def generate_lesson(self, prompt: str, metadata: dict[str, Any] | None = None, max_retries: int = 3) -> dict[str, Any]:
         """
-        Generate LessonContent JSON via DeepSeek/OpenAI/Moonshot API.
+        Generate LessonContent JSON via the DeepSeek API.
         Executes schema validation and 1-pass auto-repair.
         """
         meta = metadata or {}
@@ -289,7 +289,7 @@ class DeepSeekService:
                         **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": 4096,
-                        "temperature": 1.0 if self.model.startswith("kimi-k3") else 0.2,
+                        "temperature": 0.2,
                         "messages": [
                             {"role": "system", "content": LESSON_SYSTEM_PROMPT},
                             {"role": "user", "content": prompt},
@@ -478,11 +478,7 @@ class DeepSeekService:
         max_retries: int,
     ) -> dict[str, Any]:
         last_error = None
-        attempt_limit = (
-            max(2, max_retries)
-            if not self.model.startswith("kimi-")
-            else max_retries
-        )
+        attempt_limit = max(2, max_retries)
         for attempt in range(1, attempt_limit + 1):
             try:
                 response = requests.post(
@@ -493,9 +489,7 @@ class DeepSeekService:
                         **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": max_tokens,
-                        "temperature": (
-                            1.0 if self.model.startswith("kimi-k3") else DIALOGUE_TEMPERATURE
-                        ),
+                        "temperature": DIALOGUE_TEMPERATURE,
                         "messages": [
                             {
                                 "role": "system",
@@ -541,9 +535,7 @@ class DeepSeekService:
                         **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": max_tokens,
-                        "temperature": (
-                            1.0 if self.model.startswith("kimi-k3") else LONG_LESSON_TEMPERATURE
-                        ),
+                        "temperature": LONG_LESSON_TEMPERATURE,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": prompt},
