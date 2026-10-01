@@ -261,8 +261,51 @@ class DeepSeekServiceTest(unittest.TestCase):
         self.assertEqual(800, lesson["wordCount"])
         refinement_prompt = mock_post.call_args_list[1].kwargs["json"]["messages"][1]["content"]
         self.assertIn("Previous draft", refinement_prompt)
-        self.assertIn("exactly 16", refinement_prompt)
+        self.assertIn("12-20 alternating", refinement_prompt)
+        self.assertNotIn("exactly 16", refinement_prompt)
 
+
+    def test_scripts_are_written_for_listening(self):
+        from src.deepseek_service import (
+            DIALOGUE_LESSON_SYSTEM_PROMPT,
+            LONG_LESSON_SYSTEM_PROMPT,
+            SPOKEN_STYLE_RULES,
+        )
+        self.assertIn(SPOKEN_STYLE_RULES, DIALOGUE_LESSON_SYSTEM_PROMPT)
+        self.assertIn(SPOKEN_STYLE_RULES, LONG_LESSON_SYSTEM_PROMPT)
+        # Regression: a fixed 16-turn, 80-95 word skeleton made every dialogue sound alike.
+        self.assertNotIn("exactly 16", DIALOGUE_LESSON_SYSTEM_PROMPT)
+        self.assertNotIn("80-95", DIALOGUE_LESSON_SYSTEM_PROMPT)
+        self.assertIn("12-20 turns", DIALOGUE_LESSON_SYSTEM_PROMPT)
+
+    def test_short_varied_dialogue_is_accepted(self):
+        lengths = [12, 110, 8, 95, 20, 130, 6, 140, 15, 120, 10, 214]
+        lesson = {
+            "dialogue": [
+                {"speaker": "HOST" if index % 2 == 0 else "EXPERT", "text": " ".join(["word"] * count)}
+                for index, count in enumerate(lengths)
+            ],
+            "vocabulary": [{"word": f"term{i}"} for i in range(8)],
+            "questions": [{}] * 5,
+            "speakingPrompts": ["a", "b"],
+            "writingPrompts": ["c"],
+        }
+        self.assertEqual([], DeepSeekService._dialogue_lesson_issues(lesson))
+
+    @patch("src.deepseek_service.requests.post")
+    def test_script_generation_uses_higher_temperature_than_short_lessons(self, post):
+        from src.deepseek_service import DIALOGUE_TEMPERATURE, LONG_LESSON_TEMPERATURE
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": '{"dialogue": []}'}}]}
+        post.return_value = response
+        service = DeepSeekService(api_key="test-key")
+        service._generate_dialogue_json("test", max_tokens=1000, max_retries=1)
+        self.assertEqual(DIALOGUE_TEMPERATURE, post.call_args.kwargs["json"]["temperature"])
+        with patch("src.deepseek_service.validate_and_repair_lesson_content", return_value={}):
+            service._generate_with_prompt("test", "system", {}, max_tokens=1000, max_retries=1)
+        self.assertEqual(LONG_LESSON_TEMPERATURE, post.call_args.kwargs["json"]["temperature"])
+        self.assertGreater(LONG_LESSON_TEMPERATURE, 0.2)
 
 if __name__ == "__main__":
     unittest.main()

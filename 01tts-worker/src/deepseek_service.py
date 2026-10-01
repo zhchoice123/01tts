@@ -15,10 +15,13 @@ DIALOGUE_TARGET_MIN_WORDS = 800
 DIALOGUE_TARGET_MAX_WORDS = 950
 DIALOGUE_ACCEPT_MIN_WORDS = 700
 DIALOGUE_ACCEPT_MAX_WORDS = 1050
-DIALOGUE_TARGET_MIN_TURNS = 14
-DIALOGUE_TARGET_MAX_TURNS = 18
+DIALOGUE_TARGET_MIN_TURNS = 12
+DIALOGUE_TARGET_MAX_TURNS = 20
 DIALOGUE_ACCEPT_MIN_TURNS = 10
 DIALOGUE_ACCEPT_MAX_TURNS = 24
+# Long scripts need variety; schema validation and retries guard the JSON.
+DIALOGUE_TEMPERATURE = 0.7
+LONG_LESSON_TEMPERATURE = 0.6
 
 LESSON_SYSTEM_PROMPT = """Return JSON only adhering strictly to the LessonContent schema:
 {
@@ -55,6 +58,15 @@ escape any double quote inside a value and never stop before the final closing b
 Before responding, silently verify that the JSON parses and every required array exists.
 """
 
+# Lessons are listened to, not read: write the script the way people speak.
+SPOKEN_STYLE_RULES = """Write for the ear. Use contractions and mostly short sentences
+(under 25 words). Use natural spoken signposts such as "So here's the thing",
+"Right", "Let me put it another way", or "The catch is". Never read code, stack
+traces, URLs, or file paths aloud: name the class or method and say in words what it
+does. Write numbers, units, and percentiles the way an engineer says them, for example
+"p ninety-nine latency" and "two hundred milliseconds". Avoid lists that only work on a
+page; turn them into "first ... then ... finally" speech."""
+
 LONG_LESSON_SYSTEM_PROMPT = """Return JSON only. Create a rigorous English lesson for
 an experienced backend developer. The passage MUST contain 1200-1450 English words
 (roughly ten minutes of narration) and use clear B1-B2 English. Structure the passage
@@ -64,6 +76,7 @@ verification gives reproducible steps, expected observations and pass/fail crite
 recovery gives ordered mitigation, rollback triggers and recovery checks; design
 compares alternatives under explicit constraints. Keep introductory definitions brief.
 Include one concrete Java or Spring example, trade-offs, and a concise recap.
+""" + SPOKEN_STYLE_RULES + """
 
 Use the same LessonContent JSON schema as below:
 {
@@ -90,12 +103,15 @@ outside JSON. Do not invent claims about a supplied source; attribute and summar
 
 DIALOGUE_LESSON_SYSTEM_PROMPT = """Return one complete, valid JSON object only. Create a natural technical
 English podcast dialogue for an experienced backend developer. Use exactly two
-speakers: HOST asks focused questions and EXPERT gives practical, technically accurate
-answers. Produce exactly 16 alternating turns: 8 HOST turns and 8 EXPERT turns. Begin
-with HOST and end with a concise EXPERT recap. Each HOST turn should contain 15-25
-English words and each EXPERT turn should contain 80-95 English words, for 800-950
-spoken words in total. This should produce about 5-8 minutes of speech. Use clear B1-B2
-English. Do not put speaker labels inside the text value.
+speakers who alternate, beginning with HOST. HOST is curious and active: asks
+follow-ups, pushes back, reacts briefly ("Wait, so the pool was full the whole
+time?"), or restates an idea in plain words. EXPERT gives practical, technically
+accurate answers and sometimes asks HOST a question back. Use 12-20 turns in total.
+Vary the turn length the way real conversation does: some turns are a single short
+sentence, the longest EXPERT turns reach about 110 words, and no two EXPERT turns in a
+row have similar length. Total 800-950 spoken words, about 5-8 minutes of speech.
+Use clear B1-B2 English. Do not put speaker labels inside the text value.
+""" + SPOKEN_STYLE_RULES + """
 
 Return this shape:
 {
@@ -127,13 +143,14 @@ design decision, compare two alternatives under explicit constraints. Include on
 concrete Java or Spring example and keep foundational definitions brief. Label invented
 production cases hypothetical. Do not present delivery guarantees as unconditional,
 confuse a consumer inbox with a producer outbox, or catch a database constraint error
-inside a transaction and assume that transaction can still commit. End with a recap.
+inside a transaction and assume that transaction can still commit. Close naturally,
+for example with one practical takeaway, a short recap, or a question for the listener.
 Include 8-12 vocabulary items, exactly 5 reading questions, at least 2 speaking
 prompts, and at least 1 writing prompt. Do not include a passage field; it will be
 constructed from the dialogue. Do not use Markdown outside JSON. Do not invent claims
 about a supplied source. Keep every string JSON-safe: escape embedded double quotes,
 do not use literal newlines inside strings, do not add trailing commas, and always emit
-the final closing brace. Before responding, silently count the 16 turns and spoken words
+the final closing brace. Before responding, silently count the turns and spoken words
 and verify that the object parses as JSON.
 """
 
@@ -359,10 +376,10 @@ class DeepSeekService:
                 (
                     "The first draft failed validation because: "
                     f"{'; '.join(issues)}. Rewrite the complete draft below while "
-                    "preserving its accurate content. Use exactly 16 alternating "
-                    "HOST/EXPERT turns: each HOST turn 15-25 words and each EXPERT turn "
-                    "80-95 words. Target 850-900 combined spoken English words. Expand "
-                    "or condense the EXPERT explanations instead of adding extra turns. "
+                    "preserving its accurate content. Use 12-20 alternating HOST/EXPERT "
+                    "turns beginning with HOST, with naturally varied turn lengths. "
+                    "Target 850-900 combined spoken English words. Expand or condense "
+                    "the EXPERT explanations instead of adding extra turns. "
                     "Return one complete parseable JSON object and satisfy every schema "
                     "field.\nOriginal request:\n"
                     f"{prompt}\nPrevious draft:\n{previous_dialogue}"
@@ -472,7 +489,7 @@ class DeepSeekService:
                         **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": max_tokens,
-                        "temperature": 0.45,
+                        "temperature": DIALOGUE_TEMPERATURE,
                         "messages": [
                             {
                                 "role": "system",
@@ -518,7 +535,7 @@ class DeepSeekService:
                         **self._thinking_control(),
                         "response_format": {"type": "json_object"},
                         "max_tokens": max_tokens,
-                        "temperature": 0.35,
+                        "temperature": LONG_LESSON_TEMPERATURE,
                         "messages": [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": prompt},
