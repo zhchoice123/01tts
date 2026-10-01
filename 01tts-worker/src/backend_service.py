@@ -1337,11 +1337,10 @@ class BackendService:
                 )
                 word_count = count_english_words(str(lesson.get("passage", "")))
                 minimum_words = 700 if is_dialogue else 1200
-                maximum_words = 1050 if is_dialogue else 1500
-                if not minimum_words <= word_count <= maximum_words:
+                if word_count < minimum_words:
                     raise ValueError(
-                        "Long lesson passage must contain "
-                        f"{minimum_words}-{maximum_words} English words; got {word_count}"
+                        "Long lesson passage must contain at least "
+                        f"{minimum_words} English words; got {word_count}"
                     )
                 lesson["wordCount"] = word_count
                 lesson["estimatedDurationSeconds"] = round(

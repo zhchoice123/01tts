@@ -75,6 +75,13 @@ do not contain the date, and generated display titles do not change their identi
 Daily technical dialogues use AI-original cases rather than unrelated news feeds;
 the separate source-article recommendation remains available.
 
+Dialogue scripts aim for roughly 800-950 spoken words, and long passages aim for
+roughly 1200-1450 words. These ranges guide generation, with no hard upper word
+limit: longer complete cases can proceed to audio synthesis. Minimum lengths
+(700 words for dialogues and 1200 for long passages), structure checks, and
+duplicate detection still apply. Word counts and estimated durations reflect the
+generated text rather than the suggested range.
+
 Automatic technical generation includes previous lesson excerpts and rejects
 strong wording overlap before synthesizing audio. This lexical check complements
 selection cooldowns; it does not detect all semantic repetitions. Rejected drafts

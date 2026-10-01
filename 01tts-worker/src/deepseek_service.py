@@ -14,7 +14,6 @@ LOGGER = logging.getLogger("tts-worker.deepseek")
 DIALOGUE_TARGET_MIN_WORDS = 800
 DIALOGUE_TARGET_MAX_WORDS = 950
 DIALOGUE_ACCEPT_MIN_WORDS = 700
-DIALOGUE_ACCEPT_MAX_WORDS = 1050
 DIALOGUE_TARGET_MIN_TURNS = 12
 DIALOGUE_TARGET_MAX_TURNS = 20
 DIALOGUE_ACCEPT_MIN_TURNS = 10
@@ -68,8 +67,10 @@ does. Write numbers, units, and percentiles the way an engineer says them, for e
 page; turn them into "first ... then ... finally" speech."""
 
 LONG_LESSON_SYSTEM_PROMPT = """Return JSON only. Create a rigorous English lesson for
-an experienced backend developer. The passage MUST contain 1200-1450 English words
-(roughly ten minutes of narration) and use clear B1-B2 English. Structure the passage
+an experienced backend developer. Aim for roughly 1200-1450 English words
+(about ten minutes of narration), using clear B1-B2 English. This is a suggested
+length, not an upper limit: use more words when the case needs them, without padding
+or repetition. Structure the passage
 around the requested concrete problem and learning objective. The requested objective
 must determine the structure: diagnosis uses evidence to distinguish hypotheses;
 verification gives reproducible steps, expected observations and pass/fail criteria;
@@ -82,7 +83,7 @@ Use the same LessonContent JSON schema as below:
 {
   "title": "Specific technical title",
   "level": "B1 or B2",
-  "passage": "1200-1450 English words",
+  "passage": "A complete passage, aiming for roughly 1200-1450 English words",
   "simplifiedPassage": "A 180-260 word recap",
   "vocabulary": [{
     "word": "backpressure", "phonetic": "", "definition": "English definition",
@@ -109,7 +110,9 @@ time?"), or restates an idea in plain words. EXPERT gives practical, technically
 accurate answers and sometimes asks HOST a question back. Use 12-20 turns in total.
 Vary the turn length the way real conversation does: some turns are a single short
 sentence, the longest EXPERT turns reach about 110 words, and no two EXPERT turns in a
-row have similar length. Total 800-950 spoken words, about 5-8 minutes of speech.
+row have similar length. Aim for roughly 800-950 spoken words, about 5-8 minutes of
+speech. This is a suggested length, not an upper limit: let the case determine the
+length, without padding or repetition.
 Use clear B1-B2 English. Do not put speaker labels inside the text value.
 """ + SPOKEN_STYLE_RULES + """
 
@@ -318,7 +321,7 @@ class DeepSeekService:
         metadata: dict[str, Any] | None = None,
         max_retries: int = 2,
     ) -> dict[str, Any]:
-        """Generate and length-check a 1200-1450 word backend lesson."""
+        """Generate a backend lesson with a suggested length and minimum depth."""
         meta = metadata or {}
         lesson = self._generate_with_prompt(
             prompt,
@@ -333,8 +336,10 @@ class DeepSeekService:
             LOGGER.info("Refining long lesson issues=%s", issues)
             expansion_prompt = (
                 f"The previous JSON lesson did not meet these requirements: {'; '.join(issues)}. "
-                "Rewrite the COMPLETE JSON object so its passage contains 1200-1450 English "
-                "words. Preserve the topic and source attribution. Add technical depth, "
+                "Rewrite the COMPLETE JSON object, aiming for roughly 1200-1450 English "
+                "words with at least 1200 words. There is no upper word limit; retain "
+                "useful detail without padding or repetition. Preserve the topic and "
+                "source attribution. Add technical depth, "
                 "a concrete Java or Spring example, trade-offs, operational advice, "
                 "12-18 vocabulary items, exactly 5 questions, speaking and writing tasks. "
                 "Previous lesson JSON:\n"
@@ -378,8 +383,10 @@ class DeepSeekService:
                     f"{'; '.join(issues)}. Rewrite the complete draft below while "
                     "preserving its accurate content. Use 12-20 alternating HOST/EXPERT "
                     "turns beginning with HOST, with naturally varied turn lengths. "
-                    "Target 850-900 combined spoken English words. Expand or condense "
-                    "the EXPERT explanations instead of adding extra turns. "
+                    "Aim for roughly 800-950 combined spoken English words with at "
+                    "least 700 words. There is no upper word limit; retain useful "
+                    "detail without padding or repetition. Correct the reported "
+                    "issues without cutting explanations just to fit the target. "
                     "Return one complete parseable JSON object and satisfy every schema "
                     "field.\nOriginal request:\n"
                     f"{prompt}\nPrevious draft:\n{previous_dialogue}"
@@ -417,8 +424,8 @@ class DeepSeekService:
         speaking_count = len(lesson.get("speakingPrompts") or [])
         writing_count = len(lesson.get("writingPrompts") or [])
         issues = []
-        if not 1200 <= word_count <= 1450:
-            issues.append(f"passage has {word_count} words")
+        if word_count < 1200:
+            issues.append(f"passage has {word_count} words; minimum is 1200")
         if not 12 <= vocabulary_count <= 18:
             issues.append(f"vocabulary has {vocabulary_count} items")
         if question_count != 5:
@@ -453,8 +460,11 @@ class DeepSeekService:
                 issues.append(f"dialogue turn {index} text is empty")
             spoken_parts.append(text)
         word_count = count_english_words(" ".join(spoken_parts))
-        if not DIALOGUE_ACCEPT_MIN_WORDS <= word_count <= DIALOGUE_ACCEPT_MAX_WORDS:
-            issues.append(f"dialogue has {word_count} spoken words")
+        if word_count < DIALOGUE_ACCEPT_MIN_WORDS:
+            issues.append(
+                f"dialogue has {word_count} spoken words; "
+                f"minimum is {DIALOGUE_ACCEPT_MIN_WORDS}"
+            )
         if len(lesson.get("vocabulary") or []) not in range(8, 13):
             issues.append(
                 f"vocabulary has {len(lesson.get('vocabulary') or [])} items"
