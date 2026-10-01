@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import subprocess
 import tempfile
 import time
@@ -11,6 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+from src.speech_text import to_spoken_text
 
 LOGGER = logging.getLogger("tts-python-api.audio")
 
@@ -43,6 +44,8 @@ TARGET_LOUDNESS_LUFS = -16
 OUTPUT_SAMPLE_RATE = 24000
 TURN_GAP_MS = 450
 CHUNK_GAP_MS = 150
+# How far ahead a transcribed word may be matched in the original text.
+ALIGN_WINDOW_CHARS = 120
 
 # Legacy Edge voice names keep their accent and gender on Aliyun.
 EDGE_TO_ALIYUN_VOICES = {
@@ -335,7 +338,7 @@ def _synthesize_segments(
     work_dir.mkdir(parents=True, exist_ok=True)
     provider, provider_voice = _tts_provider_voice(voice)
     segment_paths: list[Path] = []
-    for index, chunk in enumerate(_split_text(text)):
+    for index, chunk in enumerate(_split_text(to_spoken_text(text))):
         segment_path = work_dir / f"speech-{index:03d}.mp3"
         if provider == "aliyun":
             _post_aliyun_speech(chunk, segment_path, voice=provider_voice, speed=speed)
@@ -366,20 +369,31 @@ def _synthesize_text(
 
 
 def _locate_word(text: str, word: str, cursor: int) -> tuple[int, int]:
+    """Map a transcribed word to the original text near the cursor.
+
+    The search is limited to a short window: the transcript of normalized speech
+    ("P ninety-nine") does not always appear in the original ("p99"), and an
+    unbounded search could jump to a distant repeat and misalign every later word.
+    """
     candidate = word.strip()
     if not candidate:
         return cursor, cursor
-    exact = text.casefold().find(candidate.casefold(), cursor)
+    limit = min(len(text), cursor + ALIGN_WINDOW_CHARS)
+    exact = text.casefold().find(candidate.casefold(), cursor, limit)
     if exact >= 0:
         return exact, exact + len(candidate)
 
     tokens = re.findall(r"[\w]+(?:['’-][\w]+)*", candidate, flags=re.UNICODE)
     needle = tokens[0] if tokens else candidate
-    match = re.search(re.escape(needle), text[cursor:], flags=re.IGNORECASE)
+    match = re.search(re.escape(needle), text[cursor:limit], flags=re.IGNORECASE)
     if match:
         start = cursor + match.start()
         return start, start + len(match.group(0))
-    return cursor, min(len(text), cursor + len(candidate))
+    # Fall back to the next original token so the cursor advances by one word.
+    following = re.compile(r"[\w]+(?:['’.-][\w]+)*").search(text, cursor, limit)
+    if following:
+        return following.start(), following.end()
+    return cursor, cursor
 
 
 def _transcribe_word_timings(

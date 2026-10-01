@@ -7,6 +7,8 @@ from unittest.mock import Mock, patch
 
 from src.tts_service import (
     _concat_mp3,
+    _locate_word,
+    _synthesize_segments,
     _probe_duration_ms,
     _tts_provider_voice,
     _openai_voice,
@@ -254,6 +256,25 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             output = root / "joined.mp3"
             _concat_mp3(segments, output, root, [500, 0])
             self.assertAlmostEqual(2500, _probe_duration_ms(output), delta=120)
+
+    def test_alignment_does_not_jump_to_a_distant_repeat(self):
+        # Regression: the spoken form "ninety-nine" is not in the original text,
+        # and an unbounded search matched a word paragraphs later.
+        text = "The p99 latency rose. " + "Filler words follow here. " * 10 + "Only ninety-nine remain."
+        cursor = text.index("p99")
+        start, end = _locate_word(text, "ninety-nine", cursor)
+        self.assertEqual("p99", text[start:end])
+        start, end = _locate_word(text, "latency", end)
+        self.assertEqual("latency", text[start:end])
+
+    @patch("src.tts_service._post_aliyun_speech")
+    def test_provider_receives_spoken_text(self, post):
+        with tempfile.TemporaryDirectory() as directory:
+            _synthesize_segments(
+                "Check p99 on k8s.", api_key=None, model="unused",
+                voice="aliyun:loongdavid_v2", work_dir=Path(directory),
+            )
+        self.assertEqual("Check P ninety-nine on Kubernetes.", post.call_args.args[0])
 
     def test_splits_long_text_and_maps_legacy_voice_names(self):
         text = ("A" * 3600) + " sentence end. A short final sentence."
