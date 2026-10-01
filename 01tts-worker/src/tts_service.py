@@ -37,6 +37,13 @@ ALIYUN_VOICES = {
     "loongeric_v2": "Eric · British male",
     "loongemily_v2": "Emily · British female",
 }
+# Final audio is one loudness-normalized mono MP3. Turns get a conversational
+# pause; chunks of one long text get a short sentence-level pause.
+TARGET_LOUDNESS_LUFS = -16
+OUTPUT_SAMPLE_RATE = 24000
+TURN_GAP_MS = 450
+CHUNK_GAP_MS = 150
+
 # Legacy Edge voice names keep their accent and gender on Aliyun.
 EDGE_TO_ALIYUN_VOICES = {
     "en-US-AvaNeural": "loongabby_v2",
@@ -265,36 +272,80 @@ def _post_aliyun_speech(
         raise RuntimeError("Aliyun Java TTS returned an empty audio file")
 
 
-def _concat_mp3(segment_paths: list[Path], output_path: Path, work_dir: Path) -> None:
+def _concat_mp3(
+    segment_paths: list[Path],
+    output_path: Path,
+    work_dir: Path,
+    gaps_ms: list[int] | None = None,
+) -> None:
+    """Decode, loudness-normalize, join with silences, and encode once.
+
+    gaps_ms[i] is the silence inserted after segment i. Each segment is
+    normalized separately so two voices (or two providers) play at the same
+    loudness, and all segments share one sample rate before joining.
+    """
     if not segment_paths:
         raise ValueError("at least one audio segment is required")
-    if len(segment_paths) == 1:
-        shutil.copyfile(segment_paths[0], output_path)
-        return
-    concat_file = work_dir / "segments.txt"
-    concat_file.write_text(
-        "".join(f"file '{path.as_posix()}'\n" for path in segment_paths),
-        encoding="utf-8",
-    )
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-c",
-            "copy",
-            str(output_path),
-        ],
-        check=True,
-    )
+    gaps = list(gaps_ms or [0] * len(segment_paths))
+    if len(gaps) != len(segment_paths):
+        raise ValueError("gaps_ms must have one entry per segment")
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    for path in segment_paths:
+        command += ["-i", str(path)]
+    chains = []
+    for index, gap_ms in enumerate(gaps):
+        chain = (
+            f"[{index}:a]aformat=channel_layouts=mono,"
+            f"loudnorm=I={TARGET_LOUDNESS_LUFS}:TP=-1.5:LRA=11,"
+            f"aresample={OUTPUT_SAMPLE_RATE}"
+        )
+        if gap_ms > 0:
+            chain += f",apad=pad_dur={gap_ms / 1000:.3f}"
+        chains.append(chain + f"[a{index}]")
+    labels = "".join(f"[a{index}]" for index in range(len(segment_paths)))
+    chains.append(f"{labels}concat=n={len(segment_paths)}:v=0:a=1[out]")
+    command += [
+        "-filter_complex",
+        ";".join(chains),
+        "-map",
+        "[out]",
+        "-ac",
+        "1",
+        "-ar",
+        str(OUTPUT_SAMPLE_RATE),
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "128k",
+        str(output_path),
+    ]
+    subprocess.run(command, check=True)
+
+
+def _synthesize_segments(
+    text: str,
+    *,
+    api_key: str | None,
+    model: str,
+    voice: str,
+    work_dir: Path,
+    speed: float = 1.0,
+) -> list[Path]:
+    """Synthesize text chunk by chunk and return the raw provider audio files."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    provider, provider_voice = _tts_provider_voice(voice)
+    segment_paths: list[Path] = []
+    for index, chunk in enumerate(_split_text(text)):
+        segment_path = work_dir / f"speech-{index:03d}.mp3"
+        if provider == "aliyun":
+            _post_aliyun_speech(chunk, segment_path, voice=provider_voice, speed=speed)
+        else:
+            _post_speech(
+                chunk, segment_path, api_key=_require_api_key(api_key), model=model,
+                voice=_openai_voice(provider_voice), speed=speed,
+            )
+        segment_paths.append(segment_path)
+    return segment_paths
 
 
 def _synthesize_text(
@@ -307,21 +358,11 @@ def _synthesize_text(
     work_dir: Path,
     speed: float = 1.0,
 ) -> None:
-    work_dir.mkdir(parents=True, exist_ok=True)
-    chunks = _split_text(text)
-    segment_paths: list[Path] = []
-    for index, chunk in enumerate(chunks):
-        segment_path = work_dir / f"speech-{index:03d}.mp3"
-        provider, provider_voice = _tts_provider_voice(voice)
-        if provider == "aliyun":
-            _post_aliyun_speech(chunk, segment_path, voice=provider_voice, speed=speed)
-        else:
-            _post_speech(
-                chunk, segment_path, api_key=_require_api_key(api_key), model=model,
-                voice=_openai_voice(provider_voice), speed=speed,
-            )
-        segment_paths.append(segment_path)
-    _concat_mp3(segment_paths, output_path, work_dir)
+    segment_paths = _synthesize_segments(
+        text, api_key=api_key, model=model, voice=voice, work_dir=work_dir, speed=speed,
+    )
+    gaps = [CHUNK_GAP_MS] * (len(segment_paths) - 1) + [0]
+    _concat_mp3(segment_paths, output_path, work_dir, gaps)
 
 
 def _locate_word(text: str, word: str, cursor: int) -> tuple[int, int]:
@@ -502,7 +543,7 @@ async def generate_dialogue_audio(
     expert_voice: str = "en-US-AndrewNeural",
     api_key: str | None = None,
 ) -> Path:
-    """Generate two-voice OpenAI speech and one global Whisper timeline."""
+    """Generate two-voice speech with conversational pauses and one Whisper timeline."""
     if not turns:
         raise ValueError("dialogue must contain at least one turn")
     host_provider, _ = _tts_provider_voice(host_voice)
@@ -524,6 +565,8 @@ async def generate_dialogue_audio(
     ) as temporary:
         temporary_dir = Path(temporary)
         segment_paths: list[Path] = []
+        segment_gaps: list[int] = []
+        # Each turn's span is its speech plus the pause that follows it.
         segment_durations: list[int] = []
         original_parts: list[str] = []
         character_ranges: list[tuple[int, int]] = []
@@ -533,22 +576,23 @@ async def generate_dialogue_audio(
             text = str(turn.get("text", "")).strip()
             if speaker not in {"HOST", "EXPERT"} or not text:
                 raise ValueError(f"invalid dialogue turn at index {index}")
-            segment_path = temporary_dir / f"turn-{index:03d}.mp3"
             voice = host_voice if speaker == "HOST" else expert_voice
-            await asyncio.to_thread(
-                _synthesize_text,
+            chunk_paths = await asyncio.to_thread(
+                _synthesize_segments,
                 text,
-                segment_path,
                 api_key=resolved_key,
                 model=tts_model,
                 voice=voice,
                 work_dir=temporary_dir / f"turn-{index:03d}",
-                speed=0.9,
             )
-            segment_paths.append(segment_path)
-            segment_durations.append(
-                await asyncio.to_thread(_probe_duration_ms, segment_path)
-            )
+            trailing_gap = TURN_GAP_MS if index < len(turns) - 1 else 0
+            chunk_gaps = [CHUNK_GAP_MS] * (len(chunk_paths) - 1) + [trailing_gap]
+            turn_span = sum(chunk_gaps)
+            for chunk_path in chunk_paths:
+                turn_span += await asyncio.to_thread(_probe_duration_ms, chunk_path)
+            segment_paths.extend(chunk_paths)
+            segment_gaps.extend(chunk_gaps)
+            segment_durations.append(turn_span)
             if original_parts:
                 character_cursor += 1
             start = character_cursor
@@ -561,6 +605,7 @@ async def generate_dialogue_audio(
             segment_paths,
             output_path,
             temporary_dir,
+            segment_gaps,
         )
         output_duration = await asyncio.to_thread(_probe_duration_ms, output_path)
         full_text = "\n".join(original_parts)
