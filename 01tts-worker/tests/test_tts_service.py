@@ -1,9 +1,15 @@
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.tts_service import (
+    _concat_mp3,
+    _locate_word,
+    _synthesize_segments,
+    _probe_duration_ms,
     _tts_provider_voice,
     _openai_voice,
     _post_speech,
@@ -138,7 +144,7 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
     @patch("src.tts_service._transcribe_word_timings")
     @patch("src.tts_service._concat_mp3")
     @patch("src.tts_service._probe_duration_ms")
-    @patch("src.tts_service._synthesize_text")
+    @patch("src.tts_service._synthesize_segments")
     async def test_dialogue_audio_uses_two_voices_and_global_whisper_timeline(
         self,
         synthesize,
@@ -146,15 +152,19 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
         concatenate,
         transcribe,
     ):
-        def create_segment(text, output_path, **kwargs):
-            output_path.write_bytes(b"segment")
+        def create_segments(text, *, work_dir, **kwargs):
+            work_dir.mkdir(parents=True, exist_ok=True)
+            segment = work_dir / "speech-000.mp3"
+            segment.write_bytes(b"segment")
+            return [segment]
 
-        def create_output(segment_paths, output_path, work_dir):
+        def create_output(segment_paths, output_path, work_dir, gaps_ms):
             output_path.write_bytes(b"dialogue")
 
-        synthesize.side_effect = create_segment
+        synthesize.side_effect = create_segments
         concatenate.side_effect = create_output
-        probe_duration.side_effect = [2100, 3900, 6000]
+        # Two turns of speech plus one 450 ms conversational pause.
+        probe_duration.side_effect = [2100, 3900, 6450]
         transcribe.return_value = [
             {
                 "text": "What",
@@ -190,9 +200,10 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(b"dialogue", target.read_bytes())
             self.assertEqual(0, turns[0]["startMs"])
-            self.assertEqual(2100, turns[0]["endMs"])
-            self.assertEqual(2100, turns[1]["startMs"])
-            self.assertEqual(6000, turns[1]["endMs"])
+            self.assertEqual(2550, turns[0]["endMs"])
+            self.assertEqual(2550, turns[1]["startMs"])
+            self.assertEqual(6450, turns[1]["endMs"])
+            self.assertEqual([450, 0], concatenate.call_args.args[3])
             self.assertEqual("What", turns[0]["words"][0]["text"])
             self.assertEqual(0, turns[0]["words"][0]["charStart"])
             self.assertEqual("A", turns[1]["words"][0]["text"])
@@ -203,11 +214,67 @@ class TtsServiceTest(unittest.IsolatedAsyncioTestCase):
             ["openai:nova", "openai:onyx"],
             [call.kwargs["voice"] for call in synthesize.call_args_list],
         )
-        self.assertEqual(
-            [0.9, 0.9],
-            [call.kwargs["speed"] for call in synthesize.call_args_list],
+        # Slow playback belongs to the player; synthesis keeps natural prosody.
+        self.assertTrue(
+            all("speed" not in call.kwargs for call in synthesize.call_args_list)
         )
         transcribe.assert_called_once()
+
+    @patch("src.tts_service.subprocess.run")
+    def test_concat_normalizes_each_segment_and_inserts_gaps(self, run):
+        paths = [Path("a.mp3"), Path("b.mp3"), Path("c.mp3")]
+        _concat_mp3(paths, Path("out.mp3"), Path("."), [450, 150, 0])
+
+        command = run.call_args.args[0]
+        graph = command[command.index("-filter_complex") + 1]
+        self.assertEqual(3, graph.count("loudnorm=I=-16"))
+        self.assertIn("[0:a]aformat=channel_layouts=mono", graph)
+        self.assertIn("apad=pad_dur=0.450[a0]", graph)
+        self.assertIn("apad=pad_dur=0.150[a1]", graph)
+        self.assertIn("aresample=24000[a2]", graph)
+        self.assertIn("[a0][a1][a2]concat=n=3:v=0:a=1[out]", graph)
+        self.assertNotIn("copy", command)
+
+    def test_concat_rejects_mismatched_gaps(self):
+        with self.assertRaises(ValueError):
+            _concat_mp3([Path("a.mp3")], Path("out.mp3"), Path("."), [0, 0])
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
+    def test_concat_output_length_includes_pauses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            segments = []
+            for index, (frequency, rate) in enumerate(((440, 24000), (660, 44100))):
+                segment = root / f"tone-{index}.mp3"
+                subprocess.run(
+                    ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                     "-i", f"sine=frequency={frequency}:sample_rate={rate}:duration=1",
+                     "-c:a", "libmp3lame", str(segment)],
+                    check=True,
+                )
+                segments.append(segment)
+            output = root / "joined.mp3"
+            _concat_mp3(segments, output, root, [500, 0])
+            self.assertAlmostEqual(2500, _probe_duration_ms(output), delta=120)
+
+    def test_alignment_does_not_jump_to_a_distant_repeat(self):
+        # Regression: the spoken form "ninety-nine" is not in the original text,
+        # and an unbounded search matched a word paragraphs later.
+        text = "The p99 latency rose. " + "Filler words follow here. " * 10 + "Only ninety-nine remain."
+        cursor = text.index("p99")
+        start, end = _locate_word(text, "ninety-nine", cursor)
+        self.assertEqual("p99", text[start:end])
+        start, end = _locate_word(text, "latency", end)
+        self.assertEqual("latency", text[start:end])
+
+    @patch("src.tts_service._post_aliyun_speech")
+    def test_provider_receives_spoken_text(self, post):
+        with tempfile.TemporaryDirectory() as directory:
+            _synthesize_segments(
+                "Check p99 on k8s.", api_key=None, model="unused",
+                voice="aliyun:loongdavid_v2", work_dir=Path(directory),
+            )
+        self.assertEqual("Check P ninety-nine on Kubernetes.", post.call_args.args[0])
 
     def test_splits_long_text_and_maps_legacy_voice_names(self):
         text = ("A" * 3600) + " sentence end. A short final sentence."
