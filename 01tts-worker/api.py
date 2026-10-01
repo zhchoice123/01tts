@@ -41,6 +41,7 @@ class ImportContentRequest(BaseModel):
     text: str = ""
     title: str = ""
     level: str = "B1"
+    verbatim: bool = False
 
 
 class CreateLongLessonRequest(BaseModel):
@@ -291,6 +292,7 @@ def create_app(
                 payload.text,
                 payload.title,
                 payload.level,
+                payload.verbatim,
             )
         except ValueError as error:
             raise HTTPException(400, str(error)) from error
