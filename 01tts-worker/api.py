@@ -350,6 +350,23 @@ def create_app(
     def library(request: Request) -> list[dict[str, Any]]:
         return backend(request).library()
 
+    @app.get("/api/v1/library/page")
+    def library_page(
+        request: Request,
+        page: Annotated[int, Query(ge=1)] = 1,
+        page_size: Annotated[int, Query(alias="pageSize", ge=1, le=50)] = 12,
+        query: Annotated[str, Query(max_length=100)] = "",
+        level: Annotated[str, Query(max_length=10)] = "",
+        category: Annotated[str, Query(max_length=80)] = "",
+    ) -> dict[str, Any]:
+        return backend(request).library_page(
+            page=page,
+            page_size=page_size,
+            query=query,
+            level=level,
+            category=category,
+        )
+
     @app.put("/api/v1/learning/progress")
     def put_learning_progress(
         payload: LearningProgressRequest,

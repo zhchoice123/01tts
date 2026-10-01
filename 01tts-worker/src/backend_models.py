@@ -59,6 +59,17 @@ class ContentRecord(Base):
     )
 
 
+class ContentArchiveRecord(Base):
+    """Hide reviewed duplicates without changing lessons or learning history."""
+
+    __tablename__ = "content_archives"
+
+    content_uuid: Mapped[str] = mapped_column(String(36), primary_key=True)
+    duplicate_of: Mapped[str] = mapped_column(String(36), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    archived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+
+
 class DailyPlanRecord(Base):
     __tablename__ = "daily_plans"
 

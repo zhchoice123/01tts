@@ -66,6 +66,49 @@ python api.py
 take precedence over file values. Redis, provider accounts, and any production
 proxy/TTS service must be configured separately.
 
+## Backend lesson diversity and duplicate archives
+
+Daily technical lessons use 60 concrete backend problems with four objectives:
+diagnosis, design decisions, verification, and recovery. A problem has a 14-day
+cooldown, and the same problem/objective has a 60-day cooldown. Reservation hashes
+do not contain the date, and generated display titles do not change their identity.
+Daily technical dialogues use AI-original cases rather than unrelated news feeds;
+the separate source-article recommendation remains available.
+
+Automatic technical generation includes previous lesson excerpts and rejects
+strong wording overlap before synthesizing audio. This lexical check complements
+selection cooldowns; it does not detect all semantic repetitions. Rejected drafts
+remain failed records with a `CONTENT_NOVELTY` diagnostic. Manual lessons outside
+the catalog are not automatically rejected by this gate.
+
+Reviewed duplicates are hidden using `content_archives`. Original lesson rows,
+audio, progress, historical daily plans, and direct lesson links remain available.
+Audio-only imported courses must not be deduplicated from their placeholder text.
+
+Run these commands from `01tts-worker` using the intended service environment.
+The manifest must specify UUIDs, representatives, reasons, and SHA-256 hashes of
+both lesson payloads. The tool validates the whole manifest and protects today's
+main lesson. The apply command writes an exclusive backup before inserting archives.
+
+```bash
+../venv/bin/python scripts/archive_duplicates.py --manifest reviewed.json
+../venv/bin/python scripts/archive_duplicates.py --manifest reviewed.json \
+  --apply --backup archive-backup.json
+../venv/bin/python scripts/archive_duplicates.py --restore archive-backup.json
+```
+
+The API startup creates the additive archive table. Start the updated API before
+running a dry run. Keep production backups outside the public audio directory.
+
+## Deploy the backend from GitHub
+
+Use `main` as the release branch and have the cloud server pull it directly.
+The deployment script tests each commit in an isolated release and Python
+environment, restarts the existing systemd API, and restores the previous
+release if its health check fails. Production configuration, credentials, and
+audio stay outside Git. See [the deployment guide](deploy/README.md) for initial
+setup, daily publishing, and rollback commands.
+
 ## Build and test the Android app
 
 ```bash

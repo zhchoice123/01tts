@@ -58,9 +58,12 @@ Before responding, silently verify that the JSON parses and every required array
 LONG_LESSON_SYSTEM_PROMPT = """Return JSON only. Create a rigorous English lesson for
 an experienced backend developer. The passage MUST contain 1200-1450 English words
 (roughly ten minutes of narration) and use clear B1-B2 English. Structure the passage
-with natural spoken transitions covering: an opening problem, technical background,
-core principles and architecture, a concrete Java or Spring example, trade-offs and
-operational advice, and a concise recap.
+around the requested concrete problem and learning objective. The requested objective
+must determine the structure: diagnosis uses evidence to distinguish hypotheses;
+verification gives reproducible steps, expected observations and pass/fail criteria;
+recovery gives ordered mitigation, rollback triggers and recovery checks; design
+compares alternatives under explicit constraints. Keep introductory definitions brief.
+Include one concrete Java or Spring example, trade-offs, and a concise recap.
 
 Use the same LessonContent JSON schema as below:
 {
@@ -115,8 +118,16 @@ Return this shape:
   "speakingPrompts": ["A practical spoken response task"],
   "writingPrompts": ["A 150-200 word engineering writing task"]
 }
-Cover an opening production problem, technical background, architecture and core
-principles, a concrete Java or Spring example, trade-offs, operations, and a recap.
+Organize the dialogue around the requested concrete problem and learning objective.
+The objective overrides a generic architecture overview. For diagnosis, compare
+hypotheses using concrete evidence. For verification, spend most turns on reproducible
+experiment steps, failure injection, expected observations, and pass/fail criteria.
+For recovery, give ordered mitigation, rollback triggers, and recovery checks. For a
+design decision, compare two alternatives under explicit constraints. Include one
+concrete Java or Spring example and keep foundational definitions brief. Label invented
+production cases hypothetical. Do not present delivery guarantees as unconditional,
+confuse a consumer inbox with a producer outbox, or catch a database constraint error
+inside a transaction and assume that transaction can still commit. End with a recap.
 Include 8-12 vocabulary items, exactly 5 reading questions, at least 2 speaking
 prompts, and at least 1 writing prompt. Do not include a passage field; it will be
 constructed from the dialogue. Do not use Markdown outside JSON. Do not invent claims
@@ -244,7 +255,7 @@ class DeepSeekService:
 
     def generate_lesson(self, prompt: str, metadata: dict[str, Any] | None = None, max_retries: int = 3) -> dict[str, Any]:
         """
-        Generate LessonContent JSON via the DeepSeek-compatible API.
+        Generate LessonContent JSON via the DeepSeek API.
         Executes schema validation and 1-pass auto-repair.
         """
         meta = metadata or {}

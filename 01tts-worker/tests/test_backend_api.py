@@ -346,6 +346,48 @@ class BackendApiTest(unittest.TestCase):
         self.assertEqual(200, attempt.status_code)
         self.assertEqual(1, attempt.json()["correctCount"])
 
+    def test_library_page_returns_bounded_results_and_filters(self):
+        for index in range(13):
+            response = self.client.post(
+                "/api/v1/dialogue-lessons",
+                json={
+                    "topic": f"Backend pagination lesson {index:02d}",
+                    "category": "JAVA" if index % 2 == 0 else "DATABASE",
+                    "level": "B1" if index < 8 else "B2",
+                },
+            )
+            self.assertEqual(202, response.status_code)
+
+        first = self.client.get("/api/v1/library/page?page=1&pageSize=5").json()
+        second = self.client.get("/api/v1/library/page?page=2&pageSize=5").json()
+        self.assertEqual(13, first["total"])
+        self.assertEqual(3, first["totalPages"])
+        self.assertEqual(5, len(first["items"]))
+        self.assertEqual(5, len(second["items"]))
+        self.assertTrue(
+            {item["uuid"] for item in first["items"]}.isdisjoint(
+                item["uuid"] for item in second["items"]
+            )
+        )
+        self.assertEqual(["DATABASE", "JAVA"], first["categories"])
+
+        filtered = self.client.get(
+            "/api/v1/library/page",
+            params={
+                "page": 1,
+                "pageSize": 20,
+                "query": "pagination lesson",
+                "category": "JAVA",
+                "level": "B1",
+            },
+        ).json()
+        self.assertEqual(4, filtered["total"])
+        self.assertTrue(all(item["category"] == "JAVA" for item in filtered["items"]))
+        self.assertEqual(
+            422,
+            self.client.get("/api/v1/library/page?pageSize=51").status_code,
+        )
+
     def test_failed_content_is_hidden_and_failed_daily_plan_is_replaced(self):
         first = self.client.post("/api/v1/daily-plans/2026-07-27/generate").json()
         failed_uuid = first["contentUuid"]

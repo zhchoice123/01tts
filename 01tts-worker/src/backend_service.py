@@ -13,13 +13,14 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from src.backend_config import BackendConfig
 from src.backend_models import (
     AnkiReviewLessonRecord,
     AnkiReviewTargetRecord,
     Base,
+    ContentArchiveRecord,
     ContentRecord,
     DailyGenerationRunRecord,
     DailyPlanRecord,
@@ -35,6 +36,7 @@ from src.backend_models import (
     utc_now,
 )
 from src.content_ingestion import fetch_content, fetch_feed_candidates
+from src.content_diversity import BackendTopic, TOPIC_CATALOG, duplicate_passage
 from src.deepseek_service import DeepSeekService, count_english_words
 from src.lesson_review import generate_lesson_review_report
 from src.provider_router import ProviderRouter
@@ -45,33 +47,6 @@ from src.tts_service import _tts_provider_voice, generate_audio, generate_dialog
 
 LOGGER = logging.getLogger("tts-python-api.service")
 
-DAILY_TOPICS = [
-    (
-        "JAVA",
-        "Modern Java in Production",
-        "Explain one modern Java feature and how a backend team can adopt it safely.",
-    ),
-    (
-        "SPRING",
-        "Reliable Spring Services",
-        "Explain one Spring Boot design pattern with a realistic production example.",
-    ),
-    (
-        "DATA",
-        "MySQL and Redis Trade-offs",
-        "Compare a practical MySQL or Redis design decision, including consistency and failure modes.",
-    ),
-    (
-        "DISTRIBUTED_SYSTEMS",
-        "Building Resilient Distributed Systems",
-        "Teach one distributed-systems concept through an incident and its engineering response.",
-    ),
-    (
-        "CLOUD_NATIVE",
-        "Operating Cloud-Native Backends",
-        "Explain a Docker, Kubernetes, observability, or performance topic for backend developers.",
-    ),
-]
 
 LONG_LESSON_PREFIX = "__LISTENING_LAB_LONG_V1__:"
 
@@ -771,10 +746,87 @@ class BackendService:
         with self.session_factory() as session:
             records = session.scalars(
                 select(ContentRecord)
-                .where(ContentRecord.status != "FAILED")
+                .where(
+                    ContentRecord.status != "FAILED",
+                    ContentRecord.uuid.not_in(select(ContentArchiveRecord.content_uuid)),
+                )
                 .order_by(ContentRecord.created_at.desc())
             ).all()
             return [self.content_dict(record) for record in records]
+
+    def library_page(
+        self,
+        *,
+        page: int,
+        page_size: int,
+        query: str = "",
+        level: str = "",
+        category: str = "",
+    ) -> dict[str, Any]:
+        filters = [
+            ContentRecord.status != "FAILED",
+            ContentRecord.uuid.not_in(select(ContentArchiveRecord.content_uuid)),
+        ]
+        normalized_query = query.strip()
+        normalized_level = level.strip().upper()
+        normalized_category = category.strip().upper()
+
+        if normalized_query:
+            pattern = f"%{normalized_query}%"
+            filters.append(
+                or_(
+                    ContentRecord.title.ilike(pattern),
+                    ContentRecord.source_text.ilike(pattern),
+                )
+            )
+        if normalized_level and normalized_level != "ALL":
+            filters.append(ContentRecord.level == normalized_level)
+        if normalized_category and normalized_category != "ALL":
+            filters.append(
+                ContentRecord.source_text.like(
+                    f'%"category": "{normalized_category}"%'
+                )
+            )
+
+        with self.session_factory() as session:
+            total = int(
+                session.scalar(
+                    select(func.count(ContentRecord.uuid)).where(*filters)
+                )
+                or 0
+            )
+            records = session.scalars(
+                select(ContentRecord)
+                .where(*filters)
+                .order_by(ContentRecord.created_at.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            ).all()
+            metadata_rows = session.scalars(
+                select(ContentRecord.source_text).where(
+                    ContentRecord.status != "FAILED",
+                    ContentRecord.uuid.not_in(select(ContentArchiveRecord.content_uuid)),
+                    ContentRecord.source_text.like(f"{LONG_LESSON_PREFIX}%"),
+                )
+            ).all()
+
+        categories = sorted(
+            {
+                str(metadata.get("category")).strip().upper()
+                for source_text in metadata_rows
+                if (metadata := self._long_lesson_metadata(source_text))
+                and metadata.get("category")
+            }
+        )
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        return {
+            "items": [self.content_dict(record) for record in records],
+            "page": page,
+            "pageSize": page_size,
+            "total": total,
+            "totalPages": total_pages,
+            "categories": categories,
+        }
 
     def create_attempt(
         self, content_uuid: str, answers_json: str, correct_count: int | None
@@ -809,14 +861,15 @@ class BackendService:
                 session.delete(plan)
                 session.commit()
 
-        category, title, prompt = DAILY_TOPICS[plan_date.toordinal() % len(DAILY_TOPICS)]
+        selected = self.select_daily_topics(plan_date, count=1)[0]
+        category, title, prompt = selected.category, selected.title, selected.prompt
         content = self.create_dialogue_lesson(
             topic=f"{title}. {prompt}",
             category=category,
             host_voice="en-US-AvaNeural",
             expert_voice="en-US-AndrewNeural",
             level="B1",
-            source_mode="AUTO",
+            source_mode="AI",
         )
         plan = DailyPlanRecord(plan_date=plan_date, content_uuid=content["uuid"])
         with self.session_factory() as session:
@@ -946,23 +999,20 @@ class BackendService:
                 failures.append(f"{source_url}: {error}")
                 LOGGER.warning("Daily news source failed url=%s error=%s", source_url, error)
 
-        topic_offset = resolved_date.toordinal() % len(DAILY_TOPICS)
-        for index in range(len(DAILY_TOPICS)):
+        for selected in self.select_daily_topics(resolved_date, count=3):
             if candidate_count >= 3:
                 break
-            category, title, prompt = DAILY_TOPICS[(topic_offset + index) % len(DAILY_TOPICS)]
-            source_hash = self.topic_source_hash(
-                "AI_ORIGINAL", category, f"{resolved_date}:{title}"
-            )
+            category, title, prompt = selected.category, selected.title, selected.prompt
+            source_hash = self.topic_source_hash("AI_ORIGINAL", category, title)
             if self._topic_exists(resolved_date, source_hash):
                 continue
             content = self.create_content(
                 "TEXT",
                 "",
                 (
-                    f"Recommend one timely and useful {category.lower()} topic for an "
-                    f"English learner, then write the lesson about the specific angle you "
-                    f"choose. Starting idea: {prompt} This is AI-original learning content, "
+                    f"Write a focused {category.lower()} lesson for an "
+                    f"English learner using exactly the requested problem and objective. "
+                    f"Requested case: {prompt} This is AI-original learning content, "
                     "not a live news report; do not invent current events or sources. "
                     "Choose a specific title and include useful vocabulary and "
                     "comprehension questions."
@@ -1001,6 +1051,91 @@ class BackendService:
             session.commit()
             return self.daily_generation_dict(run, self.topic_candidates(resolved_date))
 
+    def select_daily_topics(self, plan_date: date, count: int = 3) -> list[BackendTopic]:
+        """Reserve specific objectives for 60 days and base problems for 14 days."""
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(TopicCandidateRecord.source_hash, TopicCandidateRecord.plan_date)
+                .where(
+                    TopicCandidateRecord.kind == "AI_ORIGINAL",
+                    TopicCandidateRecord.plan_date > plan_date - timedelta(days=60),
+                    TopicCandidateRecord.plan_date <= plan_date,
+                )
+            ).all()
+            rows += session.execute(
+                select(ContentRecord.source_text, DailyPlanRecord.plan_date)
+                .join(DailyPlanRecord, DailyPlanRecord.content_uuid == ContentRecord.uuid)
+                .where(
+                    DailyPlanRecord.plan_date > plan_date - timedelta(days=60),
+                    DailyPlanRecord.plan_date <= plan_date,
+                )
+            ).all()
+            # Catalog lessons created directly through the API also reserve their topic.
+            local_zone = ZoneInfo(self.config.timezone)
+            cutoff = datetime.combine(plan_date - timedelta(days=60), time.min, local_zone).astimezone(timezone.utc)
+            end = datetime.combine(plan_date + timedelta(days=1), time.min, local_zone).astimezone(timezone.utc)
+            rows += session.execute(
+                select(ContentRecord.source_text, ContentRecord.created_at)
+                .where(
+                    ContentRecord.source_text.like(f"{LONG_LESSON_PREFIX}%"),
+                    ContentRecord.uuid.not_in(select(DailyPlanRecord.content_uuid)),
+                    ContentRecord.created_at >= cutoff,
+                    ContentRecord.created_at < end,
+                )
+            ).all()
+        titles = set()
+        problems = set()
+        hash_titles = {
+            self.topic_source_hash("AI_ORIGINAL", item.category, item.title): item.title
+            for item in TOPIC_CATALOG
+        }
+        for value, used_date in rows:
+            if isinstance(used_date, datetime):
+                instant = used_date if used_date.tzinfo else used_date.replace(tzinfo=timezone.utc)
+                used_date = instant.astimezone(ZoneInfo(self.config.timezone)).date()
+            value = hash_titles.get(value, value)
+            metadata = self._long_lesson_metadata(value)
+            title = str(metadata.get("topic", "")) if metadata else value
+            title = next((item.title for item in TOPIC_CATALOG if title.startswith(item.title)), title)
+            titles.add(title)
+            if used_date >= plan_date - timedelta(days=14):
+                problems.add(title.split(" — ")[0])
+        offset = plan_date.toordinal() % len(TOPIC_CATALOG)
+        ordered = TOPIC_CATALOG[offset:] + TOPIC_CATALOG[:offset]
+        selected = []
+        for candidate in ordered:
+            if candidate.title in titles or candidate.problem in problems:
+                continue
+            selected.append(candidate)
+            titles.add(candidate.title)
+            problems.add(candidate.problem)
+            if len(selected) == count:
+                return selected
+        raise ValueError("No unused backend problems available within the topic cooldown")
+
+    def novelty_history(self, record_uuid: str) -> list[tuple[str, str]]:
+        with self.session_factory() as session:
+            records = session.execute(
+                select(ContentRecord.uuid, ContentRecord.lesson_content)
+                .where(
+                    ContentRecord.uuid != record_uuid,
+                    ContentRecord.status == "READY",
+                    ContentRecord.source_type != "NEWS",
+                )
+                .order_by(ContentRecord.created_at.desc())
+                .limit(500)
+            ).all()
+        history = []
+        for content_uuid, payload in records:
+            try:
+                lesson = json.loads(payload or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            passage = str(lesson.get("passage") or "")
+            if passage and not passage.startswith("Audio-only lesson"):
+                history.append((content_uuid, passage))
+        return history
+
     def ensure_daily_generation(self) -> dict[str, Any] | None:
         now = datetime.now(ZoneInfo(self.config.timezone))
         scheduled = now.replace(
@@ -1020,6 +1155,9 @@ class BackendService:
                 .where(
                     TopicCandidateRecord.plan_date == plan_date,
                     TopicCandidateRecord.status != "FAILED",
+                    TopicCandidateRecord.content_uuid.not_in(
+                        select(ContentArchiveRecord.content_uuid)
+                    ),
                 )
                 .order_by(
                     TopicCandidateRecord.score.desc(),
@@ -1147,6 +1285,25 @@ class BackendService:
                     f"Difficulty: {difficulty}. {title_instruction} "
                     f"SourceType: {ingested.source_type}. Text: {ingested.passage[:1500]}"
                 )
+            selected_topic = next(
+                (
+                    item for item in TOPIC_CATALOG
+                    if long_metadata
+                    and str(long_metadata.get("topic", "")).startswith(item.title)
+                ),
+                None,
+            )
+            automatic_lesson = is_ai_original_topic or selected_topic is not None
+            if selected_topic:
+                prompt += "\nRequired specific scope and objective: " + selected_topic.prompt
+
+            history = self.novelty_history(record_uuid) if automatic_lesson else []
+            if history:
+                prompt += (
+                    "\nPreviously covered material follows. Do not repeat its explanation; "
+                    "keep the requested problem and add new evidence and decisions:\n"
+                    + "\n".join(previous[:220] for _, previous in history[:30])
+                )
             metadata = {
                 "uuid": record_uuid,
                 "title": original_title or ingested.title,
@@ -1199,6 +1356,11 @@ class BackendService:
                 or lesson.get("simplifiedPassage")
                 or ingested.passage
             )
+            if automatic_lesson:
+                failure_stage = "CONTENT_NOVELTY"
+                duplicate_uuid = duplicate_passage(str(passage), history)
+                if duplicate_uuid:
+                    raise ValueError(f"Generated passage repeats existing content {duplicate_uuid}; audio was not generated")
             destination = (
                 self.task_audio_dir if task else self.content_audio_dir
             ) / f"{record_uuid}.mp3"
@@ -1246,7 +1408,7 @@ class BackendService:
                     record.status = "READY"
                     record.audio_url = f"/api/v1/audio/content/{record_uuid}.mp3"
                     record.lesson_content = json.dumps(lesson, ensure_ascii=False)
-                    if long_metadata:
+                    if long_metadata or is_ai_original_topic:
                         record.title = str(lesson.get("title") or record.title)[:255]
                         record.source_url = ingested.source_url or None
                     record.failure_reason = None
